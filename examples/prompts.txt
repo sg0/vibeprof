@@ -1,0 +1,12 @@
+Describe MPI one-sided communication to a new graduate student.
+Describe the KV cache in transformers to a new graduate student.
+Describe speculative decoding to a new graduate student.
+Describe continuous batching to a new graduate student.
+Describe prefill versus decode to a new graduate student.
+Describe GPU memory bandwidth to a new graduate student.
+Describe NUMA effects on CPU inference to a new graduate student.
+Describe tensor parallelism to a new graduate student.
+Describe the roofline model to a new graduate student.
+Describe atomic fetch-and-add counters to a new graduate student.
+Describe load balancing with work stealing to a new graduate student.
+Describe chat templates to a new graduate student.

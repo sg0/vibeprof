@@ -1,0 +1,15 @@
+{"messages": [{"role": "user", "content": "Explain MPI one-sided communication in a few sentences, then give one example."}], "max_tokens": 24}
+{"messages": [{"role": "system", "content": "You are a concise HPC tutor."}, {"role": "user", "content": "Explain the KV cache in transformers in a few sentences, then give one example."}]}
+{"messages": [{"role": "user", "content": [{"type": "text", "text": "Summarize speculative decoding."}, {"type": "text", "text": " Use bullet points."}]}]}
+{"messages": [{"role": "user", "content": "Explain continuous batching in a few sentences, then give one example."}], "max_tokens": 48}
+{"messages": [{"role": "user", "content": "Explain prefill versus decode in a few sentences, then give one example."}]}
+{"messages": [{"role": "user", "content": "Explain GPU memory bandwidth in a few sentences, then give one example."}]}
+{"messages": [{"role": "user", "content": "Explain NUMA effects on CPU inference in a few sentences, then give one example."}], "max_tokens": 72}
+{"messages": [{"role": "user", "content": "Explain tensor parallelism in a few sentences, then give one example."}]}
+{"messages": [{"role": "user", "content": "Explain the roofline model in a few sentences, then give one example."}]}
+{"messages": [{"role": "user", "content": "Explain atomic fetch-and-add counters in a few sentences, then give one example."}], "max_tokens": 96}
+{"messages": [{"role": "user", "content": "Explain load balancing with work stealing in a few sentences, then give one example."}]}
+{"messages": [{"role": "user", "content": "Explain chat templates in a few sentences, then give one example."}]}
+{"prompt": "Write a haiku about supercomputers."}
+
+{"note": "record without a prompt is skipped"}

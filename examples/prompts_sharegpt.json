@@ -1,0 +1,170 @@
+[
+ {
+  "id": "c0",
+  "conversations": [
+   {
+    "from": "human",
+    "value": "What is MPI one-sided communication?"
+   },
+   {
+    "from": "gpt",
+    "value": "word word word word word word word word word word"
+   },
+   {
+    "from": "human",
+    "value": "Can you elaborate with more detail and a worked example?"
+   },
+   {
+    "from": "gpt",
+    "value": "word word word word word word word word word word word word word word word word word word word word"
+   }
+  ]
+ },
+ {
+  "id": "c1",
+  "conversations": [
+   {
+    "from": "human",
+    "value": "What is the KV cache in transformers?"
+   },
+   {
+    "from": "gpt",
+    "value": "word word word word word word word word word word word word word word word"
+   },
+   {
+    "from": "human",
+    "value": "Can you elaborate with more detail and a worked example?"
+   },
+   {
+    "from": "gpt",
+    "value": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word"
+   }
+  ]
+ },
+ {
+  "id": "c2",
+  "conversations": [
+   {
+    "from": "human",
+    "value": "What is speculative decoding?"
+   },
+   {
+    "from": "gpt",
+    "value": "word word word word word word word word word word word word word word word word word word word word"
+   },
+   {
+    "from": "human",
+    "value": "Can you elaborate with more detail and a worked example?"
+   },
+   {
+    "from": "gpt",
+    "value": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word"
+   }
+  ]
+ },
+ {
+  "id": "c3",
+  "conversations": [
+   {
+    "from": "human",
+    "value": "What is continuous batching?"
+   },
+   {
+    "from": "gpt",
+    "value": "word word word word word word word word word word word word word word word word word word word word word word word word word"
+   },
+   {
+    "from": "human",
+    "value": "Can you elaborate with more detail and a worked example?"
+   },
+   {
+    "from": "gpt",
+    "value": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word"
+   }
+  ]
+ },
+ {
+  "id": "c4",
+  "conversations": [
+   {
+    "from": "human",
+    "value": "What is prefill versus decode?"
+   },
+   {
+    "from": "gpt",
+    "value": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word"
+   },
+   {
+    "from": "human",
+    "value": "Can you elaborate with more detail and a worked example?"
+   },
+   {
+    "from": "gpt",
+    "value": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word"
+   }
+  ]
+ },
+ {
+  "id": "c5",
+  "conversations": [
+   {
+    "from": "human",
+    "value": "What is GPU memory bandwidth?"
+   },
+   {
+    "from": "gpt",
+    "value": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word"
+   },
+   {
+    "from": "human",
+    "value": "Can you elaborate with more detail and a worked example?"
+   },
+   {
+    "from": "gpt",
+    "value": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word"
+   }
+  ]
+ },
+ {
+  "id": "c6",
+  "conversations": [
+   {
+    "from": "human",
+    "value": "What is NUMA effects on CPU inference?"
+   },
+   {
+    "from": "gpt",
+    "value": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word"
+   },
+   {
+    "from": "human",
+    "value": "Can you elaborate with more detail and a worked example?"
+   },
+   {
+    "from": "gpt",
+    "value": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word"
+   }
+  ]
+ },
+ {
+  "id": "c7",
+  "conversations": [
+   {
+    "from": "human",
+    "value": "What is tensor parallelism?"
+   },
+   {
+    "from": "gpt",
+    "value": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word"
+   },
+   {
+    "from": "human",
+    "value": "Can you elaborate with more detail and a worked example?"
+   },
+   {
+    "from": "gpt",
+    "value": "word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word"
+   }
+  ]
+ }
+]
