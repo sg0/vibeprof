@@ -44,6 +44,16 @@ llama.cpp is added with `add_subdirectory` and built as static libraries: `llama
 for speculative decoding, sampling and Jinja chat templates. GGML options are passed straight through. Requires
 an MPI-3 library (MPICH, Open MPI, Cray MPICH, Intel MPI, MVAPICH…) and a C++17 compiler.
 
+**Optional: GPU-direct KV transfer.** To keep KV data in GPU memory end to end (`--kv-transport device`, see
+*KV transfer* below), apply the small llama.cpp patch before configuring:
+
+```bash
+git -C ../llama.cpp apply ../llama-mpi-disagg/patches/llama.cpp-state-seq-split.patch
+```
+
+CMake reports whether the split-state API was found. Without the patch everything else works, and KV transfer
+uses host memory.
+
 ## Run
 
 ```bash
@@ -115,6 +125,10 @@ srun -N2 --ntasks-per-node=8 --cpu-bind=cores ./build/llama_mpi_disagg -m model.
 | `--threads-prefill`, `--threads-decode` | llama.cpp threads (auto: GPU ranks 2, CPU ranks share the remaining cores) |
 | `-fa on/off`, `--kv-type f16/q8_0/f32/bf16` | must match on both sides, so they are global options |
 | `--progress none/root/all` | helper thread that drives MPI progress while the main thread is inside llama.cpp |
+| **KV transfer** | |
+| `--kv-transport auto/host/device` | `host`: one serialized blob per sequence in host memory. `device`: metadata in host memory plus KV tensor data in GPU memory, sent with GPU-aware MPI (needs the patch). `auto` (default): `device` when the patch is built and some GPU rank has GPU-aware MPI, else `host` |
+| `--kv-staging pinned/pageable` | host staging buffers on GPU ranks (default pinned) |
+| `--gpu-aware-mpi auto/yes/no` | override the runtime check (Open MPI CUDA/ROCm query, MPICH `MPIX_GPU_query_support`, Cray `MPICH_GPU_SUPPORT_ENABLED=1`) |
 | **output** | |
 | `--csv FILE` | per-request timestamps, lengths, stop reason, drafted/accepted tokens |
 | `--verify` | with `--temp 0`: the prefill rank also decodes each request locally **without speculation**; the decode rank checks the output is token-identical |
@@ -194,6 +208,29 @@ capacity, so a 128-slot GPU decode rank takes far more than a 16-slot CPU rank. 
 format records the number of KV streams, so prefill (B sequences) and decode (M sequences) contexts must both
 have exactly one, and llama.cpp restores cells into any free, not necessarily contiguous, slots.
 
+**KV transfer.** There are two transports:
+
+* **Host (default without the patch).** `llama_state_seq_get_data()` serializes each sequence's state, KV
+  data included, into host memory. On GPU ranks the staging buffers are **pinned** (allocated through ggml's
+  host buffer type for the rank's GPU, e.g. `cudaMallocHost`), so the GPU-to-host copy runs at full DMA speed
+  and the MPI library can send the buffer without an extra bounce copy. Staging buffers are pooled and reused,
+  because pinned allocation is slow.
+* **Device (`patches/llama.cpp-state-seq-split.patch`).** llama.cpp's public API can only serialize KV data
+  into host memory. Its `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE` flag only keeps a local checkpoint inside the same
+  context, and the exported bytes hold no KV data, so it can't move a sequence between processes. The patch
+  adds `llama_state_seq_{get_size,get_data,set_data}_split()`: the state's small metadata goes to host memory,
+  and the KV tensor bytes are copied device-to-device into any ggml backend buffer the caller provides. Each
+  rank that has a GPU and GPU-aware MPI puts that buffer in GPU memory. The prefill rank `MPI_Isend`s the
+  device pointer, and the decode rank `MPI_Irecv`s into its own device buffer and imports device-to-device.
+  KV data never touches host memory when both ends are such ranks; the MPI library uses GPUDirect RDMA or
+  CUDA IPC.
+
+  Ranks without a GPU or without GPU-aware MPI keep their half in pinned or plain host memory, and the format
+  is the same either way. A GPU prefill rank can therefore send straight from GPU memory to a CPU decode rank's
+  host memory, which removes the sender-side copy.
+
+  The patch uses two-sided `MPI_Isend`/`MPI_Irecv`, the most widely supported GPU-aware MPI path, rather than
+  RMA on device-memory windows, which fewer MPI implementations support.
 **Speculative decoding.** Each decode rank owns one `common_speculative` instance for all M sequences (seq id =
 slot). It is fed with `common_speculative_begin(prompt tokens)` at admission. Every step does the following:
 
@@ -289,6 +326,16 @@ template; a second "draft" with the same vocabulary and different weights).
 * **Real prompts:** all three formats, chat on/off (the template adds ~48 tokens per prompt), system prompt,
   `max_tokens`, reference-answer lengths, shuffle with cycling, EOS stops (30 of 60 at temp 1), `--output` and
   CSV.
+* **KV transfer:**
+  - The patch applies cleanly to an unmodified llama.cpp `338fce6`, and the project builds with and without it.
+  - The split format was tested with its data half in CPU buffers, since there is no GPU here. That covers the
+    patch's export/import code and the two-part messages. `--verify` was exact with flash attention off
+    (f32 and f16 KV) and on (f16 and q8_0 KV, with matched KV size); with a draft model (100% acceptance, two
+    states sharing one data buffer); with draft prefill on the decode rank; with 5 processes and batched
+    prefill; with real prompts; and with the emulated GPU-decode layout.
+  - On CPU, split export/import cost was within noise of the host blob, with an identical 1.0 MiB payload per
+    512-token request.
+  - **Not run:** real GPU buffers, pinned staging, and GPU-aware MPI (device pointers in `MPI_Isend`/`MPI_Irecv`).
 * **GPU decode** was tested for layout, per-class capacities, routing, sharing and validation errors using
   `LLAMA_MPI_EMULATE_GPUS=1 --gpus-per-node N`. This is a test hook that keeps the GPU role assignment but runs
   those ranks on the CPU. The build machine has no GPU, so **actual GPU execution (prefill or decode) has not
@@ -316,8 +363,12 @@ LLAMA_MPI_EMULATE_GPUS=1 mpirun -np 6 ./build/llama_mpi_disagg -m tiny.gguf --gp
   sequences per GPU needs several decode ranks on that GPU.
 * Chat-templated prompts are tokenized as one string with special-token parsing on. Fine for benchmarking, but
   a serving system should not parse special tokens inside user content.
-* The KV payload is staged in host memory on both sides. With GPU-aware MPI, `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE`
-  + `MPI_Put` into a pre-registered window would avoid that.
+* GPU-direct KV transfer needs the bundled llama.cpp patch, which targets llama.cpp `338fce6`. Newer checkouts
+  may need small adjustments. Without flash attention, llama.cpp stores V transposed and exports it row by
+  row; on a GPU that means many small synchronized copies per request in both transports. Keep flash
+  attention on (the default) for large transfers.
+* In-flight device staging buffers use GPU memory on the sender until the send completes, roughly one KV state
+  per request being handed off.
 * Passive-target RMA needs the target (rank 0) to make progress. Keep `--progress all` (the default) unless
   your MPI has hardware RMA atomics or asynchronous progress (e.g. `MPICH_ASYNC_PROGRESS=1`).
 * Not yet implemented: prefix caching across requests sharing a system prompt, open-loop (Poisson) arrival

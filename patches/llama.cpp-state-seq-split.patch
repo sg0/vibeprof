@@ -1,0 +1,270 @@
+diff --git a/include/llama.h b/include/llama.h
+index ae54e66..579f631 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -952,6 +952,44 @@ extern "C" {
+                     llama_seq_id   dest_seq_id,
+            llama_state_seq_flags   flags);
+ 
++    // Split sequence state, for moving a sequence between contexts without staging the KV data in host memory.
++    // The serialized state is divided into two parts:
++    //   - metadata (cell positions, sequence ids, layer layout), written to / read from host memory `meta`
++    //   - tensor data (K/V, recurrent state), copied to / from the backend buffer `buf` at `buf_offset`
++    // `buf` can be any ggml backend buffer: a GPU buffer (copies stay on the device, e.g. for GPU-aware MPI),
++    // a pinned host buffer or a CPU buffer. The two parts together carry the same information as
++    // llama_state_seq_get_data(), and the formats of sender and receiver contexts must match the same way.
++    // All copies have completed when these functions return.
++#define LLAMA_STATE_SEQ_SPLIT_API 1
++
++    // Returns the metadata size in bytes; *data_size receives the tensor-data size in bytes.
++    LLAMA_API size_t llama_state_seq_get_size_split(
++            struct llama_context * ctx,
++                    llama_seq_id   seq_id,
++                          size_t * data_size,
++           llama_state_seq_flags   flags);
++
++    // Returns the metadata bytes written (0 on failure); *data_size receives the tensor bytes copied to buf.
++    LLAMA_API size_t llama_state_seq_get_data_split(
++            struct llama_context * ctx,
++                         uint8_t * meta,
++                          size_t   meta_size,
++           ggml_backend_buffer_t   buf,
++                          size_t   buf_offset,
++                          size_t * data_size,
++                    llama_seq_id   seq_id,
++           llama_state_seq_flags   flags);
++
++    // Returns the metadata bytes read (0 on failure).
++    LLAMA_API size_t llama_state_seq_set_data_split(
++            struct llama_context * ctx,
++                   const uint8_t * meta,
++                          size_t   meta_size,
++           ggml_backend_buffer_t   buf,
++                          size_t   buf_offset,
++                    llama_seq_id   dest_seq_id,
++           llama_state_seq_flags   flags);
++
+     //
+     // Decoding
+     //
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 455f519..b2596bf 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3416,6 +3416,114 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
+     }
+ }
+ 
++//
++// split state io: metadata to/from host memory, tensor data to/from a ggml backend buffer
++//
++
++// Copies `size` bytes between a region of `t` (at byte offset `t_off`) and `buf` (at byte offset `buf_off`),
++// through 1-D I8 aliases so that ggml picks the fastest path (device-to-device, host<->device, or memcpy).
++static void llama_split_copy(ggml_context * c, ggml_tensor * t, size_t t_off, ggml_backend_buffer_t buf, size_t buf_off,
++                             size_t size, bool to_buf) {
++    ggml_reset(c);
++    ggml_tensor * a = ggml_new_tensor_1d(c, GGML_TYPE_I8, (int64_t) size);
++    ggml_tensor * b = ggml_new_tensor_1d(c, GGML_TYPE_I8, (int64_t) size);
++    ggml_backend_buffer_t t_buf = t->view_src ? t->view_src->buffer : t->buffer;
++    if (ggml_backend_tensor_alloc(t_buf, a, (char *) t->data + t_off) != GGML_STATUS_SUCCESS ||
++        ggml_backend_tensor_alloc(buf,   b, (char *) ggml_backend_buffer_get_base(buf) + buf_off) != GGML_STATUS_SUCCESS) {
++        throw std::runtime_error("split state: failed to alias tensor or buffer region");
++    }
++    if (to_buf) {
++        ggml_backend_tensor_copy(a, b);
++    } else {
++        ggml_backend_tensor_copy(b, a);
++    }
++}
++
++class llama_io_count_split : public llama_io_write_i {
++public:
++    void write(const void * /* src */, size_t size) override { meta += size; }
++    void write_tensor(ggml_tensor * /* tensor */, size_t /* offset */, size_t size) override { data += size; }
++    size_t n_bytes() override { return meta; }
++    size_t meta = 0, data = 0;
++};
++
++class llama_io_write_split : public llama_io_write_i {
++public:
++    llama_io_write_split(uint8_t * p, size_t len, ggml_backend_buffer_t buf, size_t buf_offset)
++        : ptr(p), meta_left(len), buf(buf), pos(buf_offset) {
++        ggml_init_params params = { 2*ggml_tensor_overhead(), NULL, true };
++        c.reset(ggml_init(params));
++    }
++
++    void write(const void * src, size_t size) override {
++        if (size > meta_left) {
++            throw std::runtime_error("split state: metadata buffer too small");
++        }
++        memcpy(ptr, src, size);
++        ptr += size;
++        meta_left -= size;
++        meta_written += size;
++    }
++
++    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
++        if (pos + size > ggml_backend_buffer_get_size(buf)) {
++            throw std::runtime_error("split state: data buffer too small");
++        }
++        llama_split_copy(c.get(), tensor, offset, buf, pos, size, true);
++        pos += size;
++        data_written += size;
++    }
++
++    size_t n_bytes() override { return meta_written; }
++    size_t data_bytes() const { return data_written; }
++
++private:
++    uint8_t * ptr;
++    size_t meta_left;
++    size_t meta_written = 0;
++    ggml_backend_buffer_t buf;
++    size_t pos;
++    size_t data_written = 0;
++    ggml_context_ptr c;
++};
++
++class llama_io_read_split : public llama_io_read_i {
++public:
++    llama_io_read_split(const uint8_t * p, size_t len, ggml_backend_buffer_t buf, size_t buf_offset)
++        : ptr(p), meta_left(len), buf(buf), pos(buf_offset) {
++        ggml_init_params params = { 2*ggml_tensor_overhead(), NULL, true };
++        c.reset(ggml_init(params));
++    }
++
++    void read(void * dst, size_t size) override {
++        if (size > meta_left) {
++            throw std::runtime_error("split state: unexpectedly reached end of metadata");
++        }
++        memcpy(dst, ptr, size);
++        ptr += size;
++        meta_left -= size;
++        meta_read += size;
++    }
++
++    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
++        if (pos + size > ggml_backend_buffer_get_size(buf)) {
++            throw std::runtime_error("split state: unexpectedly reached end of data buffer");
++        }
++        llama_split_copy(c.get(), tensor, offset, buf, pos, size, false);
++        pos += size;
++    }
++
++    size_t n_bytes() override { return meta_read; }
++
++private:
++    const uint8_t * ptr;
++    size_t meta_left;
++    size_t meta_read = 0;
++    ggml_backend_buffer_t buf;
++    size_t pos;
++    ggml_context_ptr c;
++};
++
+ static constexpr uint32_t io_magic = 0xaf143cd8;
+ 
+ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
+@@ -3490,6 +3598,59 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
+     }
+ }
+ 
++size_t llama_context::state_seq_get_size_split(llama_seq_id seq_id, size_t * data_size, llama_state_seq_flags flags) {
++    llama_io_count_split io;
++    try {
++        io.write(&io_magic, sizeof(io_magic));
++        io.write(&seq_id, sizeof(seq_id));
++        state_seq_write_data(io, seq_id, flags);
++        if (data_size) {
++            *data_size = io.data;
++        }
++        return io.meta;
++    } catch (const std::exception & err) {
++        LLAMA_LOG_ERROR("%s: error getting split state size: %s\n", __func__, err.what());
++        return 0;
++    }
++}
++
++size_t llama_context::state_seq_get_data_split(llama_seq_id seq_id, uint8_t * meta, size_t meta_size,
++                                               ggml_backend_buffer_t buf, size_t buf_offset, size_t * data_size, llama_state_seq_flags flags) {
++    llama_io_write_split io(meta, meta_size, buf, buf_offset);
++    try {
++        io.write(&io_magic, sizeof(io_magic));
++        io.write(&seq_id, sizeof(seq_id));
++        state_seq_write_data(io, seq_id, flags);
++        if (data_size) {
++            *data_size = io.data_bytes();
++        }
++        return io.n_bytes();
++    } catch (const std::exception & err) {
++        LLAMA_LOG_ERROR("%s: error saving split state: %s\n", __func__, err.what());
++        return 0;
++    }
++}
++
++size_t llama_context::state_seq_set_data_split(llama_seq_id seq_id, const uint8_t * meta, size_t meta_size,
++                                               ggml_backend_buffer_t buf, size_t buf_offset, llama_state_seq_flags flags) {
++    llama_io_read_split io(meta, meta_size, buf, buf_offset);
++    try {
++        uint32_t magic_read;
++        io.read(&magic_read, sizeof(magic_read));
++        if (io_magic != magic_read) {
++            throw std::runtime_error("wrong sequence state magic");
++        }
++        llama_seq_id seq_id_read;
++        io.read(&seq_id_read, sizeof(seq_id_read));
++        state_seq_read_data(io, seq_id, flags);
++        return io.n_bytes();
++    } catch (const std::exception & err) {
++        LLAMA_LOG_ERROR("%s: error loading split state: %s\n", __func__, err.what());
++        io.discard();
++        return 0;
++    }
++}
++
+ bool llama_context::state_load_file(const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+     llama_file file(filepath, "rb");
+ 
+@@ -4593,6 +4754,24 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
+     return ctx->state_seq_set_data(seq_id, src, size, flags);
+ }
+ 
++size_t llama_state_seq_get_size_split(llama_context * ctx, llama_seq_id seq_id, size_t * data_size, llama_state_seq_flags flags) {
++    return ctx->state_seq_get_size_split(seq_id, data_size, flags);
++}
++
++size_t llama_state_seq_get_data_split(llama_context * ctx, uint8_t * meta, size_t meta_size, ggml_backend_buffer_t buf, size_t buf_offset,
++                                      size_t * data_size, llama_seq_id seq_id, llama_state_seq_flags flags) {
++    ctx->synchronize();
++
++    return ctx->state_seq_get_data_split(seq_id, meta, meta_size, buf, buf_offset, data_size, flags);
++}
++
++size_t llama_state_seq_set_data_split(llama_context * ctx, const uint8_t * meta, size_t meta_size, ggml_backend_buffer_t buf, size_t buf_offset,
++                                      llama_seq_id seq_id, llama_state_seq_flags flags) {
++    ctx->synchronize();
++
++    return ctx->state_seq_set_data_split(seq_id, meta, meta_size, buf, buf_offset, flags);
++}
++
+ size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
+     ctx->synchronize();
+ 
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 6938fb1..0691814 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -165,6 +165,12 @@ struct llama_context {
+     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
+     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
+ 
++    size_t state_seq_get_size_split(llama_seq_id seq_id, size_t * data_size, llama_state_seq_flags flags);
++    size_t state_seq_get_data_split(llama_seq_id seq_id,       uint8_t * meta, size_t meta_size,
++                                    ggml_backend_buffer_t buf, size_t buf_offset, size_t * data_size, llama_state_seq_flags flags);
++    size_t state_seq_set_data_split(llama_seq_id seq_id, const uint8_t * meta, size_t meta_size,
++                                    ggml_backend_buffer_t buf, size_t buf_offset, llama_state_seq_flags flags);
++
+     bool state_load_file(
+             const char * filepath,
+            llama_token * tokens_out,

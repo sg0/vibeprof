@@ -28,6 +28,17 @@ set(LLAMA_OPENSSL         OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_COMMON    ON  CACHE BOOL "" FORCE)   # common_speculative, common_sampler, chat templates
 add_subdirectory(${LLAMA_CPP_DIR} llama.cpp EXCLUDE_FROM_ALL)
 
+# GPU-direct KV transfer (--kv-transport device) needs llama.cpp with the split-state API from
+# patches/llama.cpp-state-seq-split.patch; without it the build still works with --kv-transport host.
+file(READ "${LLAMA_CPP_DIR}/include/llama.h" _llama_h)
+string(FIND "${_llama_h}" "LLAMA_STATE_SEQ_SPLIT_API" _split_pos)
+if (_split_pos EQUAL -1)
+    message(STATUS "llama-mpi-disagg: split-state API not found in llama.cpp: --kv-transport device unavailable "
+                   "(apply patches/llama.cpp-state-seq-split.patch to enable it)")
+else()
+    message(STATUS "llama-mpi-disagg: split-state API found: --kv-transport device available")
+endif()
+
 add_executable(llama_mpi_disagg src/llama_mpi_disagg.cpp)
 target_link_libraries(llama_mpi_disagg PRIVATE llama-common llama ggml MPI::MPI_CXX Threads::Threads)
 install(TARGETS llama_mpi_disagg RUNTIME DESTINATION bin)

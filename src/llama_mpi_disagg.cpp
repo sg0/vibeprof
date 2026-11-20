@@ -23,6 +23,9 @@
 // Build: see CMakeLists.txt / README.md.
 
 #include <mpi.h>
+#if defined(OPEN_MPI) && OPEN_MPI
+#include <mpi-ext.h>          // MPIX_Query_cuda_support / MPIX_Query_rocm_support
+#endif
 
 #include "ggml-backend.h"
 #include "llama.h"
@@ -176,6 +179,10 @@ struct Args {
     int decode_gpus      = 0;   // GPU decode ranks per node
     bool hide_gpus_on_decode = true;
     std::string progress = "all";
+    // KV transfer
+    std::string kv_transport = "auto";   // auto | host | device
+    std::string kv_staging   = "pinned"; // pinned | pageable
+    std::string gpu_aware    = "auto";   // auto | yes | no
     // output
     std::string csv;
     int warmup = 1;
@@ -185,6 +192,7 @@ struct Args {
     std::vector<common_speculative_type> spec_types;
     bool use_spec  = false;
     bool use_draft = false;
+    std::string kv_desc;                 // resolved KV transport, for the report
 };
 
 static void usage(const char * prog) {
@@ -254,6 +262,12 @@ static void usage(const char * prog) {
         "       --prefill-per-node N  prefill ranks per node (default = prefill GPUs, or half if none)\n"
         "       --no-hide-gpus        do not hide GPUs from CPU decode ranks\n"
         "       --progress none|root|all  MPI async-progress helper thread (default all)\n"
+        "KV transfer:\n"
+        "       --kv-transport auto|host|device  host = one serialized blob in host memory; device = metadata on\n"
+        "                             the host + KV tensor data in GPU memory, sent with GPU-aware MPI (needs the\n"
+        "                             patched llama.cpp, see patches/). auto = device if available (default)\n"
+        "       --kv-staging pinned|pageable  host staging buffers on GPU ranks (default pinned)\n"
+        "       --gpu-aware-mpi auto|yes|no  override GPU-aware MPI detection (default auto)\n"
         "output:\n"
         "       --csv PATH            per-request records\n"
         "       --warmup N            warmup iterations per rank (default 1)\n"
@@ -330,6 +344,9 @@ static Args parse_args(int argc, char ** argv) {
         else if (k == "--decode-gpus")                  a.decode_gpus = atoi(need(i));
         else if (k == "--no-hide-gpus")                 a.hide_gpus_on_decode = false;
         else if (k == "--progress")                     a.progress = need(i);
+        else if (k == "--kv-transport")                 a.kv_transport = need(i);
+        else if (k == "--kv-staging")                   a.kv_staging = need(i);
+        else if (k == "--gpu-aware-mpi")                a.gpu_aware = need(i);
         else if (k == "--csv")                          a.csv = need(i);
         else if (k == "--warmup")                       a.warmup = atoi(need(i));
         else if (k == "-v"  || k == "--verbose")        a.verbose = true;
@@ -349,6 +366,9 @@ static Args parse_args(int argc, char ** argv) {
     if (a.prefill_batch < 1)  fatal("--prefill-batch must be >= 1");
     if (a.prefill_tokens < 0) fatal("--prefill-tokens must be >= 0");
     if (a.claim != "fixed" && a.claim != "guided") fatal("--claim must be fixed|guided");
+    if (a.kv_transport != "auto" && a.kv_transport != "host" && a.kv_transport != "device") fatal("--kv-transport must be auto|host|device");
+    if (a.kv_staging != "pinned" && a.kv_staging != "pageable") fatal("--kv-staging must be pinned|pageable");
+    if (a.gpu_aware != "auto" && a.gpu_aware != "yes" && a.gpu_aware != "no") fatal("--gpu-aware-mpi must be auto|yes|no");
     if (!(a.claim_factor > 0)) fatal("--claim-factor must be > 0");
     if (a.decode_ubatch < 1)  fatal("--decode-ubatch must be >= 1");
     if (a.prompt_mode != "tokens" && a.prompt_mode != "words") fatal("--prompt-mode must be tokens|words");
@@ -871,15 +891,21 @@ enum : int { TAG_HDR = 1, TAG_DONE = 2 };
 static constexpr int64_t KV_CHUNK = 1LL << 30;   // payload chunk (bytes) per MPI message
 enum : int32_t { STOP_LENGTH = 0, STOP_EOS = 1 };
 
-// prefill -> decode, on comm_ctl. Payload (comm_kv) = [prompt tokens | target KV | draft KV]
+// prefill -> decode, on comm_ctl. Payload on comm_kv:
+//   tag 0 (host memory):  [prompt tokens | target state | draft state]   (state = full blob, or metadata if split)
+//   tag 1 (split only):   [target tensor data | draft tensor data]       (GPU memory with GPU-aware MPI)
 struct KvHeader {
     int64_t  task_id;
     int64_t  rec_idx;         // dataset record (-1 = synthetic)
     int64_t  tok_bytes, kv_tgt_bytes, kv_dft_bytes;
+    int64_t  dat_tgt_bytes, dat_dft_bytes;   // split: tensor data sizes (0 otherwise)
     int32_t  isl, max_out, first_token, prefill_rank;
     int32_t  done;            // 1 = finished at prefill (first token was EOG, or max_out == 1): no payload
     int32_t  truncated;       // prompt was truncated to fit the context
+    int32_t  split;           // 1 = split format
+    int32_t  pad_;
     double   t_claim, t_prefill_start, t_first, t_send;
+    double   t_pack;          // seconds spent exporting the state on the prefill rank
     uint64_t ref_hash;        // --verify: hash of the locally decoded reference (0 = none)
 };
 
@@ -888,6 +914,7 @@ struct ReqRecord {
     int32_t isl, max_out, n_gen, prefill_rank, decode_rank, stop, verify, truncated;
     int32_t n_steps, n_drafted, n_accepted, pad_;
     double  t_claim, t_prefill_start, t_first, t_send, t_kv_ready, t_done;
+    double  t_pack, t_unpack;   // state export (prefill) / import (decode) time
 };
 
 enum Role : int32_t { ROLE_PREFILL = 0, ROLE_DECODE = 1 };
@@ -911,6 +938,9 @@ struct RankStat {
     double  t_draft_prefill;// draft-model prompt processing
     int64_t claims;         // prefill: NXTVAL claim operations
     int64_t claimed;        // prefill: tasks obtained by those claims
+    int32_t kv_mode;        // payload buffers: 0 host, 1 pinned host, 2 GPU memory
+    int32_t pad2_;
+    int64_t stage_bytes;    // staging buffer memory allocated (pools)
 };
 
 static uint64_t fnv1a(uint64_t h, llama_token t) {
@@ -994,12 +1024,99 @@ static llama_model * load_model(const std::string & path, int dev, int ngl) {
 }
 
 // ----------------------------------------------------------------------------
+// KV transfer: staging buffer pools, GPU-aware MPI detection, split-state wrappers
+// ----------------------------------------------------------------------------
+
+// Pool of ggml backend buffers of one type (GPU memory, pinned host memory or plain CPU memory). Pinned
+// and device allocations are expensive, so buffers are reused across requests; a new buffer is only
+// allocated when no free one is large enough (sizes are rounded up by at most ~12.5% to help reuse).
+class BufPool {
+public:
+    void init(ggml_backend_buffer_type_t buft) { buft_ = buft; }
+    ggml_backend_buffer_t acquire(size_t size) {
+        size = std::max<size_t>(size, 1);
+        auto best = free_.end();
+        for (auto it = free_.begin(); it != free_.end(); ++it) {
+            const size_t sz = ggml_backend_buffer_get_size(*it);
+            if (sz >= size && (best == free_.end() || sz < ggml_backend_buffer_get_size(*best))) best = it;
+        }
+        if (best != free_.end()) { ggml_backend_buffer_t b = *best; free_.erase(best); return b; }
+        size_t q = 64 * 1024;
+        while (q * 8 < size) q *= 2;
+        const size_t alloc = (size + q - 1) / q * q;
+        ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(buft_, alloc);
+        if (!b) fatal("failed to allocate a %.1f MiB %s staging buffer", alloc / 1048576.0, ggml_backend_buft_name(buft_));
+        bytes_ += ggml_backend_buffer_get_size(b);
+        return b;
+    }
+    void release(ggml_backend_buffer_t b) { if (b) free_.push_back(b); }
+    void free_all() { for (auto * b : free_) ggml_backend_buffer_free(b); free_.clear(); }
+    size_t bytes() const { return bytes_; }
+private:
+    ggml_backend_buffer_type_t buft_ = nullptr;
+    std::vector<ggml_backend_buffer_t> free_;
+    size_t bytes_ = 0;
+};
+
+static uint8_t * buf_ptr(ggml_backend_buffer_t b) { return (uint8_t *) ggml_backend_buffer_get_base(b); }
+
+struct KvXfer {
+    bool split = false;                            // split format: metadata (host) + tensor data (data_buft)
+    bool pinned = false;                           // host staging uses pinned memory
+    bool data_on_device = false;                   // split tensor data lives in GPU memory (GPU-aware MPI)
+    ggml_backend_buffer_type_t host_buft = nullptr;
+    ggml_backend_buffer_type_t data_buft = nullptr;
+};
+
+// Best-effort runtime check for GPU-aware MPI (Open MPI CUDA/ROCm, MPICH >= 4 incl. derivatives, Cray MPICH).
+static bool detect_gpu_aware_mpi(std::string & how) {
+#if defined(MPIX_CUDA_AWARE_SUPPORT) && MPIX_CUDA_AWARE_SUPPORT
+    if (MPIX_Query_cuda_support()) { how = "Open MPI (CUDA)"; return true; }
+#endif
+#if defined(MPIX_ROCM_AWARE_SUPPORT) && MPIX_ROCM_AWARE_SUPPORT
+    if (MPIX_Query_rocm_support()) { how = "Open MPI (ROCm)"; return true; }
+#endif
+#if defined(MPIX_GPU_SUPPORT_CUDA)
+    {
+        const std::pair<int, const char *> kinds[] = {{MPIX_GPU_SUPPORT_CUDA, "CUDA"}, {MPIX_GPU_SUPPORT_HIP, "HIP"}, {MPIX_GPU_SUPPORT_ZE, "Level Zero"}};
+        for (const auto & [kind, name] : kinds) {
+            int ok = 0;
+            if (MPIX_GPU_query_support(kind, &ok) == MPI_SUCCESS && ok) { how = std::string("MPICH (") + name + ")"; return true; }
+        }
+    }
+#endif
+    const char * cray = getenv("MPICH_GPU_SUPPORT_ENABLED");
+    if (cray && atoi(cray) == 1) { how = "MPICH_GPU_SUPPORT_ENABLED=1"; return true; }
+    how = "not detected";
+    return false;
+}
+
+#ifdef LLAMA_STATE_SEQ_SPLIT_API
+static constexpr bool k_split_api = true;
+static size_t kv_size_split(llama_context * c, llama_seq_id s, size_t * data) {
+    return llama_state_seq_get_size_split(c, s, data, LLAMA_STATE_SEQ_FLAGS_NONE);
+}
+static size_t kv_get_split(llama_context * c, uint8_t * meta, size_t n, ggml_backend_buffer_t b, size_t off, size_t * data, llama_seq_id s) {
+    return llama_state_seq_get_data_split(c, meta, n, b, off, data, s, LLAMA_STATE_SEQ_FLAGS_NONE);
+}
+static size_t kv_set_split(llama_context * c, const uint8_t * meta, size_t n, ggml_backend_buffer_t b, size_t off, llama_seq_id s) {
+    return llama_state_seq_set_data_split(c, meta, n, b, off, s, LLAMA_STATE_SEQ_FLAGS_NONE);
+}
+#else
+static constexpr bool k_split_api = false;
+static size_t kv_size_split(llama_context *, llama_seq_id, size_t *) { fatal("built without the llama.cpp split-state API"); }
+static size_t kv_get_split(llama_context *, uint8_t *, size_t, ggml_backend_buffer_t, size_t, size_t *, llama_seq_id) { fatal("built without the llama.cpp split-state API"); }
+static size_t kv_set_split(llama_context *, const uint8_t *, size_t, ggml_backend_buffer_t, size_t, llama_seq_id) { fatal("built without the llama.cpp split-state API"); }
+#endif
+
+// ----------------------------------------------------------------------------
 // PREFILL rank
 // ----------------------------------------------------------------------------
 
 struct Outgoing {
-    std::vector<uint8_t>     buf;
-    KvHeader                 hdr;
+    ggml_backend_buffer_t    hbuf = nullptr, dbuf = nullptr;   // host part / split tensor data
+    size_t                   hbytes = 0, dbytes = 0;
+    KvHeader                 hdr{};
     std::vector<MPI_Request> reqs;
 };
 
@@ -1013,6 +1130,7 @@ struct PrefillCtx {
     std::vector<int64_t> cap_seq, cap_cells;   // per global rank (0 for prefill ranks)
     int rr = 0;
     RankStat * st;
+    BufPool hpool, dpool;
 };
 
 static void reap_sends(PrefillCtx & P, bool wait_all) {
@@ -1020,7 +1138,7 @@ static void reap_sends(PrefillCtx & P, bool wait_all) {
         int done = 0;
         if (wait_all) { MPI_Waitall((int) it->reqs.size(), it->reqs.data(), MPI_STATUSES_IGNORE); done = 1; }
         else          { MPI_Testall((int) it->reqs.size(), it->reqs.data(), &done, MPI_STATUSES_IGNORE); }
-        if (done) it = P.outq.erase(it); else ++it;
+        if (done) { P.hpool.release(it->hbuf); P.dpool.release(it->dbuf); it = P.outq.erase(it); } else ++it;
     }
 }
 
@@ -1071,7 +1189,7 @@ struct Task {
 static void run_prefill(const Args & a, llama_model * model, llama_model * model_dft, GlobalCounters & gc,
                         MPI_Comm comm_ctl, MPI_Comm comm_kv, const std::vector<int> & decode_ranks,
                         const std::vector<int64_t> & cap_seq, const std::vector<int64_t> & cap_cells,
-                        const std::vector<Record> & dataset, int threads, bool on_gpu, RankStat & st) {
+                        const std::vector<Record> & dataset, int threads, bool on_gpu, const KvXfer & X, RankStat & st) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const int B = a.prefill_batch;
     const int n_batch = std::max(a.n_batch, 32);
@@ -1102,7 +1220,9 @@ static void run_prefill(const Args & a, llama_model * model, llama_model * model
         if (ctx_dft) { if (llama_decode(ctx_dft, batch) != 0) fatal("warmup draft prefill failed"); llama_memory_seq_rm(mem_dft, 0, -1, -1); }
     }
 
-    PrefillCtx P{&a, &gc, comm_ctl, comm_kv, decode_ranks, {}, {}, cap_seq, cap_cells, g_rank % (int) decode_ranks.size(), &st};
+    PrefillCtx P{&a, &gc, comm_ctl, comm_kv, decode_ranks, {}, {}, cap_seq, cap_cells, g_rank % (int) decode_ranks.size(), &st, {}, {}};
+    P.hpool.init(X.host_buft);
+    P.dpool.init(X.data_buft);
 
     auto make_task = [&](int64_t id, double t_claim) {
         Task t{id, -1, 0, 0, false, t_claim, {}};
@@ -1236,41 +1356,73 @@ static void run_prefill(const Args & a, llama_model * model, llama_model * model
                 llama_memory_seq_rm(mem, s, t.isl, -1);
             }
 
+            // export: prompt tokens + target [+ draft] state into staging buffers
             Outgoing o;
-            size_t got_t = 0, got_d = 0;
+            size_t got_t = 0, got_d = 0, dat_t = 0, dat_d = 0;
             const size_t ntb = done ? 0 : t.toks.size() * sizeof(llama_token);
+            const double t_pack0 = now_s();
             if (!done) {
-                const size_t sz_t = llama_state_seq_get_size(ctx, s);
-                const size_t sz_d = ctx_dft ? llama_state_seq_get_size(ctx_dft, s) : 0;
-                o.buf.resize(ntb + sz_t + sz_d);
-                memcpy(o.buf.data(), t.toks.data(), ntb);
-                got_t = llama_state_seq_get_data(ctx, o.buf.data() + ntb, sz_t, s);
-                if (got_t == 0) fatal("llama_state_seq_get_data failed for task %" PRId64, t.id);
-                if (ctx_dft) {
-                    got_d = llama_state_seq_get_data(ctx_dft, o.buf.data() + ntb + got_t, sz_d, s);
-                    if (got_d == 0) fatal("draft llama_state_seq_get_data failed for task %" PRId64, t.id);
+                if (!X.split) {
+                    const size_t sz_t = llama_state_seq_get_size(ctx, s);
+                    const size_t sz_d = ctx_dft ? llama_state_seq_get_size(ctx_dft, s) : 0;
+                    o.hbuf = P.hpool.acquire(ntb + sz_t + sz_d);
+                    uint8_t * h = buf_ptr(o.hbuf);
+                    memcpy(h, t.toks.data(), ntb);
+                    got_t = llama_state_seq_get_data(ctx, h + ntb, sz_t, s);
+                    if (got_t == 0) fatal("llama_state_seq_get_data failed for task %" PRId64, t.id);
+                    if (ctx_dft) {
+                        got_d = llama_state_seq_get_data(ctx_dft, h + ntb + got_t, sz_d, s);
+                        if (got_d == 0) fatal("draft llama_state_seq_get_data failed for task %" PRId64, t.id);
+                    }
+                } else {
+                    size_t need_t = 0, need_d = 0;
+                    const size_t mt = kv_size_split(ctx, s, &need_t);
+                    const size_t md = ctx_dft ? kv_size_split(ctx_dft, s, &need_d) : 0;
+                    o.hbuf = P.hpool.acquire(ntb + mt + md);
+                    o.dbuf = P.dpool.acquire(need_t + need_d);
+                    uint8_t * h = buf_ptr(o.hbuf);
+                    memcpy(h, t.toks.data(), ntb);
+                    got_t = kv_get_split(ctx, h + ntb, mt, o.dbuf, 0, &dat_t, s);
+                    if (got_t == 0) fatal("split state export failed for task %" PRId64, t.id);
+                    if (ctx_dft) {
+                        got_d = kv_get_split(ctx_dft, h + ntb + got_t, md, o.dbuf, dat_t, &dat_d, s);
+                        if (got_d == 0) fatal("draft split state export failed for task %" PRId64, t.id);
+                    }
                 }
-                o.buf.resize(ntb + got_t + got_d);
+                o.hbytes = ntb + got_t + got_d;
+                o.dbytes = dat_t + dat_d;
             }
+            const double t_pack = now_s() - t_pack0;
             llama_memory_seq_rm(mem, s, -1, -1);
             if (ctx_dft) llama_memory_seq_rm(mem_dft, s, -1, -1);
 
             const int dst = reserve_decode_slot(P, (int64_t) t.isl + t.max_out);
-            o.hdr = KvHeader{t.id, t.rec, (int64_t) ntb, (int64_t) got_t, (int64_t) got_d, t.isl, t.max_out, first_tok[s], g_rank,
-                             done ? 1 : 0, t.truncated ? 1 : 0, t.t_claim, t_pf, t_first[s], now_s(), ref};
+            KvHeader & H = o.hdr;
+            H.task_id = t.id;           H.rec_idx = t.rec;
+            H.tok_bytes = (int64_t) ntb; H.kv_tgt_bytes = (int64_t) got_t; H.kv_dft_bytes = (int64_t) got_d;
+            H.dat_tgt_bytes = (int64_t) dat_t; H.dat_dft_bytes = (int64_t) dat_d;
+            H.isl = t.isl;              H.max_out = t.max_out;   H.first_token = first_tok[s]; H.prefill_rank = g_rank;
+            H.done = done ? 1 : 0;      H.truncated = t.truncated ? 1 : 0; H.split = (X.split && !done) ? 1 : 0;
+            H.t_claim = t.t_claim;      H.t_prefill_start = t_pf; H.t_first = t_first[s]; H.t_send = now_s();
+            H.t_pack = t_pack;          H.ref_hash = ref;
             P.outq.push_back(std::move(o));
             Outgoing & q = P.outq.back();
             MPI_Request r;
             MPI_Isend(&q.hdr, (int) sizeof(KvHeader), MPI_BYTE, dst, TAG_HDR, comm_ctl, &r);
             q.reqs.push_back(r);
-            for (int64_t off = 0; off < (int64_t) q.buf.size(); off += KV_CHUNK) {
-                const int n = (int) std::min<int64_t>(KV_CHUNK, (int64_t) q.buf.size() - off);
-                MPI_Isend(q.buf.data() + off, n, MPI_BYTE, dst, 0, comm_kv, &r);
-                q.reqs.push_back(r);
-            }
+            auto send_part = [&](ggml_backend_buffer_t b, size_t bytes, int tag) {
+                for (int64_t off = 0; off < (int64_t) bytes; off += KV_CHUNK) {
+                    const int n = (int) std::min<int64_t>(KV_CHUNK, (int64_t) bytes - off);
+                    MPI_Isend(buf_ptr(b) + off, n, MPI_BYTE, dst, tag, comm_kv, &r);   // device pointer if data_on_device
+                    q.reqs.push_back(r);
+                }
+            };
+            if (q.hbytes) send_part(q.hbuf, q.hbytes, 0);
+            if (q.dbytes) send_part(q.dbuf, q.dbytes, 1);
             st.requests++;
             st.tokens_out++;   // first token
-            logr("task %" PRId64 " isl=%d max_out=%d -> decode rank %d (%.1f KiB)", t.id, t.isl, t.max_out, dst, q.buf.size() / 1024.0);
+            logr("task %" PRId64 " isl=%d max_out=%d -> decode rank %d (%.1f KiB host + %.1f KiB data)", t.id, t.isl, t.max_out, dst,
+                 q.hbytes / 1024.0, q.dbytes / 1024.0);
         }
         for (auto * s : smpl) common_sampler_free(s);
         reap_sends(P, false);
@@ -1282,6 +1434,9 @@ static void run_prefill(const Args & a, llama_model * model, llama_model * model
         MPI_Send(&z, 1, MPI_INT, d, TAG_DONE, comm_ctl);
     }
     st.wall = now_s();
+    st.stage_bytes = (int64_t) (P.hpool.bytes() + (X.split ? P.dpool.bytes() : 0));
+    P.hpool.free_all();
+    P.dpool.free_all();
 
     llama_batch_free(batch);
     if (ctx_dft) llama_free(ctx_dft);
@@ -1295,7 +1450,7 @@ static void run_prefill(const Args & a, llama_model * model, llama_model * model
 struct Incoming {
     KvHeader hdr;
     int src;
-    std::vector<uint8_t> buf;
+    ggml_backend_buffer_t hbuf = nullptr, dbuf = nullptr;
     std::vector<MPI_Request> reqs;
 };
 
@@ -1307,6 +1462,7 @@ struct Seq {
     llama_token last = 0;           // newest token, not yet in the KV cache
     common_sampler * smpl = nullptr;
     double t_kv_ready = 0;
+    double t_unpack = 0;
     uint64_t hash = FNV0;
     int stop = STOP_LENGTH;
     std::vector<llama_token> hist;  // tokens in the KV cache: prompt + generated except `last`
@@ -1321,7 +1477,7 @@ struct Seq {
 struct OutText { int64_t task_id, rec_idx; int32_t isl, n_gen, stop; std::string text; };
 
 static void run_decode(const Args & a, llama_model * model, llama_model * model_dft, GlobalCounters & gc,
-                       MPI_Comm comm_ctl, MPI_Comm comm_kv, int n_prefill_ranks, int threads, bool on_gpu,
+                       MPI_Comm comm_ctl, MPI_Comm comm_kv, int n_prefill_ranks, int threads, bool on_gpu, const KvXfer & X,
                        int M, int64_t n_cells, RankStat & st, std::vector<ReqRecord> & recs, std::vector<OutText> & outs) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const int n_draft_max = a.use_spec ? a.spec_n_max : 0;
@@ -1384,6 +1540,9 @@ static void run_decode(const Args & a, llama_model * model, llama_model * model_
 
     std::vector<int> free_slots;
     for (int s = M - 1; s >= 0; --s) free_slots.push_back(s);
+    BufPool hpool, dpool;
+    hpool.init(X.host_buft);
+    dpool.init(X.data_buft);
     std::deque<Incoming> incoming;
     std::vector<Seq> active;
     int done_from = 0;
@@ -1392,10 +1551,11 @@ static void run_decode(const Args & a, llama_model * model, llama_model * model_
     auto finish = [&](Seq & q, double t_kv_ready) {
         const double t = now_s();
         const int verify = q.hdr.ref_hash ? (q.hash == q.hdr.ref_hash ? 1 : 0) : -1;
-        recs.push_back(ReqRecord{q.hdr.task_id, q.hdr.rec_idx, q.hdr.kv_tgt_bytes + q.hdr.kv_dft_bytes,
+        recs.push_back(ReqRecord{q.hdr.task_id, q.hdr.rec_idx, q.hdr.kv_tgt_bytes + q.hdr.kv_dft_bytes + q.hdr.dat_tgt_bytes + q.hdr.dat_dft_bytes,
                                  q.hdr.isl, q.hdr.max_out, q.n_gen, q.hdr.prefill_rank, g_rank, q.stop, verify, q.hdr.truncated,
                                  q.n_steps, q.n_drafted, q.n_accepted, 0,
-                                 q.hdr.t_claim, q.hdr.t_prefill_start, q.hdr.t_first, q.hdr.t_send, t_kv_ready, t});
+                                 q.hdr.t_claim, q.hdr.t_prefill_start, q.hdr.t_first, q.hdr.t_send, t_kv_ready, t,
+                                 q.hdr.t_pack, q.t_unpack});
         if (!a.output.empty()) {
             std::string text;
             for (llama_token tk : q.out) if (!llama_vocab_is_eog(vocab, tk)) text += common_token_to_piece(vocab, tk, false);
@@ -1431,14 +1591,19 @@ static void run_decode(const Args & a, llama_model * model, llama_model * model_
                 Incoming & in = incoming.back();
                 in.src = stt.MPI_SOURCE;
                 MPI_Mrecv(&in.hdr, (int) sizeof(KvHeader), MPI_BYTE, &msg, MPI_STATUS_IGNORE);
-                const int64_t total = in.hdr.tok_bytes + in.hdr.kv_tgt_bytes + in.hdr.kv_dft_bytes;
-                in.buf.resize(total);
-                for (int64_t off = 0; off < total; off += KV_CHUNK) {
-                    const int n = (int) std::min<int64_t>(KV_CHUNK, total - off);
-                    MPI_Request r;
-                    MPI_Irecv(in.buf.data() + off, n, MPI_BYTE, in.src, 0, comm_kv, &r);
-                    in.reqs.push_back(r);
-                }
+                const int64_t htotal = in.hdr.tok_bytes + in.hdr.kv_tgt_bytes + in.hdr.kv_dft_bytes;
+                const int64_t dtotal = in.hdr.dat_tgt_bytes + in.hdr.dat_dft_bytes;
+                if (in.hdr.split && !X.split) fatal("received a split-format payload but this rank uses the host format");
+                auto recv_part = [&](ggml_backend_buffer_t b, int64_t bytes, int tag) {
+                    for (int64_t off = 0; off < bytes; off += KV_CHUNK) {
+                        const int n = (int) std::min<int64_t>(KV_CHUNK, bytes - off);
+                        MPI_Request r;
+                        MPI_Irecv(buf_ptr(b) + off, n, MPI_BYTE, in.src, tag, comm_kv, &r);   // device pointer if data_on_device
+                        in.reqs.push_back(r);
+                    }
+                };
+                if (htotal > 0) { in.hbuf = hpool.acquire(htotal); recv_part(in.hbuf, htotal, 0); }
+                if (dtotal > 0) { in.dbuf = dpool.acquire(dtotal); recv_part(in.dbuf, dtotal, 1); }
             } else {
                 int z;
                 MPI_Mrecv(&z, 1, MPI_INT, &msg, MPI_STATUS_IGNORE);
@@ -1469,17 +1634,27 @@ static void run_decode(const Args & a, llama_model * model, llama_model * model_
             if (free_slots.empty()) fatal("decode capacity exceeded (reservation protocol violated)");
             q.slot = free_slots.back();
             free_slots.pop_back();
-            const uint8_t * p = it->buf.data();
+            const uint8_t * p = buf_ptr(it->hbuf);
             const llama_token * tp = (const llama_token *) p;
             q.hist.assign(tp, tp + q.hdr.isl);
             q.hist.reserve(q.hdr.isl + q.hdr.max_out + 1);
-            if (llama_state_seq_set_data(ctx, p + q.hdr.tok_bytes, q.hdr.kv_tgt_bytes, q.slot) == 0)
-                fatal("llama_state_seq_set_data failed for task %" PRId64 " (KV layout mismatch? check -fa/--kv-type)", q.hdr.task_id);
+            const double tu0 = now_s();
+            const bool ok_t = q.hdr.split
+                ? kv_set_split(ctx, p + q.hdr.tok_bytes, q.hdr.kv_tgt_bytes, it->dbuf, 0, q.slot) != 0
+                : llama_state_seq_set_data(ctx, p + q.hdr.tok_bytes, q.hdr.kv_tgt_bytes, q.slot) != 0;
+            if (!ok_t) fatal("state import failed for task %" PRId64 " (KV layout mismatch? check -fa/--kv-type)", q.hdr.task_id);
+            if (ctx_dft && q.hdr.kv_dft_bytes > 0) {
+                const uint8_t * pd = p + q.hdr.tok_bytes + q.hdr.kv_tgt_bytes;
+                const bool ok_d = q.hdr.split
+                    ? kv_set_split(ctx_dft, pd, q.hdr.kv_dft_bytes, it->dbuf, q.hdr.dat_tgt_bytes, q.slot) != 0
+                    : llama_state_seq_set_data(ctx_dft, pd, q.hdr.kv_dft_bytes, q.slot) != 0;
+                if (!ok_d) fatal("draft state import failed for task %" PRId64, q.hdr.task_id);
+            }
+            q.t_unpack = now_s() - tu0;
+            hpool.release(it->hbuf); it->hbuf = nullptr;
+            dpool.release(it->dbuf); it->dbuf = nullptr;
             if (ctx_dft) {
-                if (q.hdr.kv_dft_bytes > 0) {
-                    if (llama_state_seq_set_data(ctx_dft, p + q.hdr.tok_bytes + q.hdr.kv_tgt_bytes, q.hdr.kv_dft_bytes, q.slot) == 0)
-                        fatal("draft llama_state_seq_set_data failed for task %" PRId64, q.hdr.task_id);
-                } else {                                     // --draft-prefill decode
+                if (q.hdr.kv_dft_bytes == 0) {                // --draft-prefill decode
                     const double td = now_s();
                     for (int i0 = 0; i0 < q.hdr.isl; i0 += n_batch) {
                         dpb.n_tokens = 0;
@@ -1586,6 +1761,9 @@ static void run_decode(const Args & a, llama_model * model, llama_model * model_
         }
     }
     st.wall = now_s();
+    st.stage_bytes = (int64_t) (hpool.bytes() + (X.split ? dpool.bytes() : 0));
+    hpool.free_all();
+    dpool.free_all();
     if (spec && g_verbose) common_speculative_print_stats(spec);
     common_speculative_free(spec);
     llama_batch_free(dpb);
@@ -1631,7 +1809,7 @@ static void print_header(const char * title) {
 }
 
 static void report(const Args & a, const std::vector<ReqRecord> & R, const std::vector<RankStat> & S, int64_t n_records) {
-    std::vector<double> ttft, tpot, e2e, pf, wait, xfer, kvmb, isl, osl, dec_tps, acc_rate, tok_step;
+    std::vector<double> ttft, tpot, e2e, pf, wait, xfer, kvmb, isl, osl, dec_tps, acc_rate, tok_step, pack, unpack;
     double makespan = 0;
     int64_t sum_in = 0, sum_out = 0, n_eos = 0, n_trunc = 0;
     for (const auto & r : R) {
@@ -1641,6 +1819,7 @@ static void report(const Args & a, const std::vector<ReqRecord> & R, const std::
         pf.push_back((r.t_first - r.t_prefill_start) * 1e3);
         wait.push_back((r.t_send - r.t_first) * 1e3);
         xfer.push_back((r.t_kv_ready - r.t_send) * 1e3);
+        if (r.kv_bytes > 0) { pack.push_back(r.t_pack * 1e3); unpack.push_back(r.t_unpack * 1e3); }
         kvmb.push_back(r.kv_bytes / (1024.0 * 1024.0));
         isl.push_back(r.isl);
         osl.push_back(r.n_gen);
@@ -1669,23 +1848,24 @@ static void report(const Args & a, const std::vector<ReqRecord> & R, const std::
     printf(" generation       : EOS %s, temp %.2f, top-k %d, top-p %.2f\n", a.ignore_eos ? "ignored" : "stops", a.temp, a.top_k, a.top_p);
     printf(" llama.cpp        : ctx/seq %d, prefill-batch %d (%s claims), prefill-tokens %d, decode-batch cpu %s / gpu %s, fa %s, kv %s\n",
            a.ctx, a.prefill_batch, a.claim == "guided" ? ("guided, K=" + std::to_string(a.claim_factor).substr(0, 4)).c_str() : "fixed", a.prefill_tokens, a.decode_batch.c_str(), a.decode_batch_gpu.c_str(), a.flash_attn ? "on" : "off", a.kv_type.c_str());
+    printf(" KV transport     : %s\n", a.kv_desc.c_str());
     if (a.use_spec)
         printf(" speculative      : %s, draft-max %d%s%s%s\n", common_speculative_type_name_str(a.spec_types).c_str(), a.spec_n_max,
                a.use_draft ? (", draft model " + a.draft_model + ", draft prefill on " + a.draft_prefill).c_str() : "",
                a.spec_rejection ? ", rejection sampling" : "",
                a.spec_synth_len != -1.0 ? (", SYNTHETIC acceptance len " + std::to_string(a.spec_synth_len)).c_str() : "");
     printf("\n Rank layout:\n");
-    printf("  %5s %-8s %5s %6s %5s %8s %6s %9s %9s %9s %10s %10s %10s %9s %9s %7s %8s\n",
-           "rank", "role", "node", "local", "gpu", "threads", "slots", "kv_cells", "peak_seq", "requests",
+    printf("  %5s %-8s %5s %6s %5s %6s %8s %6s %9s %9s %9s %10s %10s %10s %9s %9s %7s %8s\n",
+           "rank", "role", "node", "local", "gpu", "kvbuf", "threads", "slots", "kv_cells", "peak_seq", "requests",
            "tok_in", "tok_out", "steps", "busy[s]", "util%", "acc%", "tok/step");
     for (const auto & s : S) {
         const bool dc = s.role == ROLE_DECODE;
         char acc[16] = "-", tps[16] = "-";
         if (dc && s.drafted > 0)   snprintf(acc, sizeof(acc), "%.1f", 100.0 * s.accepted / s.drafted);
         if (dc && s.seq_steps > 0) snprintf(tps, sizeof(tps), "%.2f", (double) (s.accepted + s.seq_steps) / s.seq_steps);
-        printf("  %5d %-8s %5d %6d %5s %8d %6s %9s %9s %9" PRId64 " %10" PRId64 " %10" PRId64 " %10" PRId64 " %9.3f %8.1f%% %7s %8s\n",
+        printf("  %5d %-8s %5d %6d %5s %6s %8d %6s %9s %9s %9" PRId64 " %10" PRId64 " %10" PRId64 " %10" PRId64 " %9.3f %8.1f%% %7s %8s\n",
                s.rank, dc ? "decode" : "prefill", s.node, s.local_rank,
-               s.gpu >= 0 ? std::to_string(s.gpu).c_str() : "cpu", s.threads,
+               s.gpu >= 0 ? std::to_string(s.gpu).c_str() : "cpu", s.kv_mode == 2 ? "gpu" : (s.kv_mode == 1 ? "pinned" : "host"), s.threads,
                dc ? std::to_string(s.slots).c_str() : "-", dc ? std::to_string(s.kv_cells).c_str() : "-",
                dc ? std::to_string(s.peak_seqs).c_str() : "-", s.requests, s.tokens_in, s.tokens_out,
                s.steps, s.busy, s.wall > 0 ? 100.0 * s.busy / s.wall : 0.0, acc, tps);
@@ -1697,7 +1877,9 @@ static void report(const Args & a, const std::vector<ReqRecord> & R, const std::
     print_row("E2E latency", "ms", e2e);
     print_row("prefill compute (batch)", "ms", pf);
     print_row("decode-slot wait + KV pack", "ms", wait);
+    print_row("KV export (pack, prefill)", "ms", pack);
     print_row("KV transfer (send->ready)", "ms", xfer);
+    print_row("KV import (unpack, decode)", "ms", unpack);
     print_row("KV state size", "MiB", kvmb);
     print_row("input length", "tok", isl);
     print_row("output length", "tok", osl);
@@ -1974,6 +2156,44 @@ int main(int argc, char ** argv) {
         if (!a.n_set) a.n_requests = n_records;
     }
 
+    // ---- KV transport: host blob, or split (metadata on host + tensor data in GPU memory via GPU-aware MPI) ----
+    KvXfer X;
+    {
+        std::string how;
+        const bool detected  = detect_gpu_aware_mpi(how);
+        const bool real_gpu  = dev >= 0 && !emulate_gpus();
+        const bool aware     = a.gpu_aware == "yes" || (a.gpu_aware == "auto" && detected);
+        const int  capable   = (real_gpu && aware) ? 1 : 0;
+        int any_capable = 0, n_capable = 0;
+        MPI_Allreduce(&capable, &any_capable, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+        MPI_Allreduce(&capable, &n_capable,   1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+        if (a.kv_transport == "device" && !k_split_api)
+            fatal("--kv-transport device needs llama.cpp with the split-state API: apply patches/llama.cpp-state-seq-split.patch and rebuild");
+        X.split = a.kv_transport == "device" || (a.kv_transport == "auto" && k_split_api && any_capable);
+        ggml_backend_dev_t gdev = nullptr;
+        if (real_gpu) { auto g = gpu_devices(); if (!g.empty()) gdev = g[dev % (int) g.size()]; }
+        ggml_backend_buffer_type_t pinned = (gdev && a.kv_staging == "pinned") ? ggml_backend_dev_host_buffer_type(gdev) : nullptr;
+        X.pinned         = pinned != nullptr;
+        X.host_buft      = pinned ? pinned : ggml_backend_cpu_buffer_type();
+        X.data_on_device = X.split && capable && gdev;
+        X.data_buft      = X.data_on_device ? ggml_backend_dev_buffer_type(gdev) : X.host_buft;
+        int n_pinned = X.pinned ? 1 : 0;
+        MPI_Allreduce(MPI_IN_PLACE, &n_pinned, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+        char d[512];
+        if (X.split)
+            snprintf(d, sizeof(d), "split (metadata in host memory, KV data %s; GPU-aware MPI on rank 0: %s%s)",
+                     n_capable > 0 ? (std::to_string(n_capable) + " rank(s) keep KV data in GPU memory").c_str() : "in host memory on all ranks",
+                     a.gpu_aware == "auto" ? how.c_str() : ("forced " + a.gpu_aware).c_str(), k_split_api ? "" : "");
+        else
+            snprintf(d, sizeof(d), "host (one serialized blob per sequence; %s%s)",
+                     n_pinned > 0 ? (std::to_string(n_pinned) + " GPU rank(s) stage in pinned memory").c_str() : "pageable staging",
+                     k_split_api ? "" : "; split-state API not built, --kv-transport device unavailable");
+        a.kv_desc = d;
+        if (g_rank == 0 && a.kv_transport == "device" && !any_capable)
+            fprintf(stderr, "warning: --kv-transport device, but no rank can keep KV data in GPU memory (no GPU, or GPU-aware MPI\n"
+                            "         not detected; see --gpu-aware-mpi). Using the split format with host buffers.\n");
+    }
+
     // ---- RMA counters + communicators ----
     GlobalCounters gc;
     gc.init(MPI_COMM_WORLD);
@@ -2012,11 +2232,12 @@ int main(int argc, char ** argv) {
     RankStat st{};
     st.rank = g_rank; st.role = role; st.node = node_id; st.local_rank = lrank; st.gpu = dev; st.threads = threads;
     st.slots = my_cap[0]; st.kv_cells = my_cap[1];
+    st.kv_mode = X.data_on_device ? 2 : (X.pinned ? 1 : 0);
     std::vector<ReqRecord> recs;
     std::vector<OutText> outs;
 
-    if (role == ROLE_PREFILL) run_prefill(a, model, model_dft, gc, comm_ctl, comm_kv, decode_ranks, cap_seq, cap_cells, dataset, threads, dev >= 0, st);
-    else                      run_decode(a, model, model_dft, gc, comm_ctl, comm_kv, n_pf, threads, dev >= 0, (int) my_cap[0], my_cap[1], st, recs, outs);
+    if (role == ROLE_PREFILL) run_prefill(a, model, model_dft, gc, comm_ctl, comm_kv, decode_ranks, cap_seq, cap_cells, dataset, threads, dev >= 0, X, st);
+    else                      run_decode(a, model, model_dft, gc, comm_ctl, comm_kv, n_pf, threads, dev >= 0, X, (int) my_cap[0], my_cap[1], st, recs, outs);
 
     MPI_Barrier(MPI_COMM_WORLD);
     prog.stop();
