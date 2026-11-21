@@ -1,0 +1,105 @@
+diff --git a/ref/src/cg_solve.hpp b/ref/src/cg_solve.hpp
+index 79f2abb..a75b394 100644
+--- a/ref/src/cg_solve.hpp
++++ b/ref/src/cg_solve.hpp
+@@ -1,6 +1,8 @@
+ #ifndef _cg_solve_hpp_
+ #define _cg_solve_hpp_
+ 
++#include <vibeprof.h>
++
+ //@HEADER
+ // ************************************************************************
+ //
+@@ -149,15 +151,16 @@ cg_solve(OperatorType& A,
+ #endif
+ 
+ 
++  VIBEPROF_SCOPE("cg");
+   for(LocalOrdinalType k=1; k <= max_iter && normr > tolerance; ++k) {
+     if (k == 1) {
+       TICK(); waxpby(one, r, zero, r, p); TOCK(tWAXPY);
+     }
+     else {
+       oldrtrans = rtrans;
+-      TICK(); rtrans = dot(r, r); TOCK(tDOT);
++      { VIBEPROF_SCOPE("dot"); TICK(); rtrans = dot(r, r); TOCK(tDOT); }
+       magnitude_type beta = rtrans/oldrtrans;
+-      TICK(); waxpby(one, r, beta, p, p); TOCK(tWAXPY);
++      { VIBEPROF_SCOPE("waxpby"); TICK(); waxpby(one, r, beta, p, p); TOCK(tWAXPY); }
+     }
+ 
+     normr = std::sqrt(rtrans);
+@@ -174,9 +177,9 @@ cg_solve(OperatorType& A,
+     p_ap_dot = matvec_and_dot(A, p, Ap);
+     TOCK(tMATVECDOT);
+ #else
+-    TICK(); matvec(A, p, Ap); TOCK(tMATVEC);
++    { VIBEPROF_SCOPE("matvec"); TICK(); matvec(A, p, Ap); TOCK(tMATVEC); }
+ 
+-    TICK(); p_ap_dot = dot(Ap, p); TOCK(tDOT);
++    { VIBEPROF_SCOPE("dot"); TICK(); p_ap_dot = dot(Ap, p); TOCK(tDOT); }
+ #endif
+ 
+ #ifdef MINIFE_DEBUG
+@@ -208,8 +211,8 @@ cg_solve(OperatorType& A,
+     fused_waxpby(one, x, alpha, p, x, one, r, -alpha, Ap, r);
+     TOCK(tWAXPY);
+ #else
+-    TICK(); waxpby(one, x, alpha, p, x);
+-            waxpby(one, r, -alpha, Ap, r); TOCK(tWAXPY);
++    { VIBEPROF_SCOPE("waxpby"); TICK(); waxpby(one, x, alpha, p, x);
++            waxpby(one, r, -alpha, Ap, r); TOCK(tWAXPY); }
+ #endif
+ 
+     num_iters = k;
+diff --git a/ref/src/driver.hpp b/ref/src/driver.hpp
+index 2c155d5..5846e86 100644
+--- a/ref/src/driver.hpp
++++ b/ref/src/driver.hpp
+@@ -57,6 +57,7 @@
+ 
+ #include <compute_matrix_stats.hpp>
+ #include <make_local_matrix.hpp>
++#include <vibeprof.h>
+ #include <imbalance.hpp>
+ #include <cg_solve.hpp>
+ #if MINIFE_KERNELS != 0
+@@ -177,6 +178,7 @@ driver(const Box& global_box, Box& my_box,
+ 
+   MatrixType A;
+ 
++  vibeprof_phase_begin("setup");
+   timer_type gen_structure;
+   RUN_TIMED_FUNCTION("generating matrix structure...",
+                      generate_matrix_structure(mesh, A),
+@@ -234,6 +236,8 @@ driver(const Box& global_box, Box& my_box,
+   write_vector("b_local.vec", b);
+ #endif
+ 
++  vibeprof_phase_end("setup");
++
+   size_t global_nnz = compute_matrix_stats(A, myproc, numprocs, ydoc);
+ 
+   //Prepare to perform conjugate gradient solve:
+diff --git a/ref/src/exchange_externals.hpp b/ref/src/exchange_externals.hpp
+index 6cdf026..9d73a17 100644
+--- a/ref/src/exchange_externals.hpp
++++ b/ref/src/exchange_externals.hpp
+@@ -1,6 +1,8 @@
+ #ifndef _exchange_externals_hpp_
+ #define _exchange_externals_hpp_
+ 
++#include <vibeprof.h>
++
+ //@HEADER
+ // ************************************************************************
+ //
+@@ -47,6 +49,7 @@ void
+ exchange_externals(MatrixType& A,
+                    VectorType& x)
+ {
++  VIBEPROF_SCOPE("halo");
+ #ifdef HAVE_MPI
+ #ifdef MINIFE_DEBUG
+   std::ostream& os = outstream();

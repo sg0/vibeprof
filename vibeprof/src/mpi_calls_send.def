@@ -1,0 +1,6 @@
+/* MPI_Send / MPI_Isend: same columns as mpi_calls.def (kept apart so the perturbation library can
+ * replace their PMPI layer by hand, e.g. to turn them into synchronous sends). */
+X(Send,  (const void *buf, int count, MPI_Datatype datatype, int dest, int tag, MPI_Comm comm),
+         (buf, count, datatype, dest, tag, comm), comm, tsz(count, datatype), dest, K_SEND)
+X(Isend, (const void *buf, int count, MPI_Datatype datatype, int dest, int tag, MPI_Comm comm, MPI_Request *request),
+         (buf, count, datatype, dest, tag, comm, request), comm, tsz(count, datatype), dest, K_SEND)

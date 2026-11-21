@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(llama_mpi_disagg CXX C)
+project(vibeprof_llm CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -33,12 +33,12 @@ add_subdirectory(${LLAMA_CPP_DIR} llama.cpp EXCLUDE_FROM_ALL)
 file(READ "${LLAMA_CPP_DIR}/include/llama.h" _llama_h)
 string(FIND "${_llama_h}" "LLAMA_STATE_SEQ_SPLIT_API" _split_pos)
 if (_split_pos EQUAL -1)
-    message(STATUS "llama-mpi-disagg: split-state API not found in llama.cpp: --kv-transport device unavailable "
+    message(STATUS "vibeprof-llm: split-state API not found in llama.cpp: --kv-transport device unavailable "
                    "(apply patches/llama.cpp-state-seq-split.patch to enable it)")
 else()
-    message(STATUS "llama-mpi-disagg: split-state API found: --kv-transport device available")
+    message(STATUS "vibeprof-llm: split-state API found: --kv-transport device available")
 endif()
 
-add_executable(llama_mpi_disagg src/llama_mpi_disagg.cpp)
-target_link_libraries(llama_mpi_disagg PRIVATE llama-common llama ggml MPI::MPI_CXX Threads::Threads)
-install(TARGETS llama_mpi_disagg RUNTIME DESTINATION bin)
+add_executable(vibeprof_llm src/vibeprof_llm.cpp)
+target_link_libraries(vibeprof_llm PRIVATE llama-common llama ggml MPI::MPI_CXX Threads::Threads)
+install(TARGETS vibeprof_llm RUNTIME DESTINATION bin)

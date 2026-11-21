@@ -1,4 +1,20 @@
-# llama-mpi-disagg
+# vibeprof
+
+vibeprof profiles MPI and MPI+GPU applications without changing them: a PMPI/CUPTI collector is
+preloaded into the ranks, and an analysis step finds where the time goes and why (load imbalance,
+slow nodes, waiting, expensive collectives, idle GPUs, staging copies, ...). It writes an
+interactive HTML report with charts, a short brief with suggestions, and optionally an
+interpretation written by an LLM that runs on the same cluster.
+
+| Part | Where | What |
+|---|---|---|
+| profiler | [`vibeprof/`](vibeprof/README.md) | `libvibeprof.so` (MPI + NVIDIA GPU collector), phase markers, analysis, reports, `vibeprof-srun` |
+| vibeprof-llm | `src/vibeprof_llm.cpp` (this directory's CMake project) | in-process llama.cpp inference over MPI with disaggregated prefill/decode; writes the optional LLM interpretation of profiles, and is a benchmark in its own right |
+
+The rest of this file documents vibeprof-llm; the profiler is documented in
+[vibeprof/README.md](vibeprof/README.md).
+
+# vibeprof-llm
 
 A C++/MPI wrapper around **llama.cpp (linked statically, run in-process — no server)** that runs continuously
 batched, **disaggregated prefill/decode** inference across the CPUs and GPUs of a cluster, on synthetic or real
@@ -48,7 +64,7 @@ an MPI-3 library (MPICH, Open MPI, Cray MPICH, Intel MPI, MVAPICH…) and a C++1
 *KV transfer* below), apply the small llama.cpp patch before configuring:
 
 ```bash
-git -C ../llama.cpp apply ../llama-mpi-disagg/patches/llama.cpp-state-seq-split.patch
+git -C ../llama.cpp apply ../vibeprof/patches/llama.cpp-state-seq-split.patch
 ```
 
 CMake reports whether the split-state API was found. Without the patch everything else works, and KV transfer
@@ -58,24 +74,24 @@ uses host memory.
 
 ```bash
 # synthetic: 1 node, 4 GPUs, 12 ranks -> ranks 0-3 prefill on GPUs 0-3, ranks 4-11 decode on CPU cores
-mpirun -np 12 ./build/llama_mpi_disagg -m model.gguf -n 512 --isl 1024 --isl-std 256 --osl 256 --decode-batch 16
+mpirun -np 12 ./build/vibeprof_llm -m model.gguf -n 512 --isl 1024 --isl-std 256 --osl 256 --decode-batch 16
 
 # real prompts (ShareGPT), chat template applied, output lengths from the reference answers, stop at EOS
-mpirun -np 12 ./build/llama_mpi_disagg -m model.gguf -p ShareGPT_V3_unfiltered_cleaned_split.json \
+mpirun -np 12 ./build/vibeprof_llm -m model.gguf -p ShareGPT_V3_unfiltered_cleaned_split.json \
        --osl-from-data --shuffle -n 2000 --temp 0.7 --output answers.jsonl --csv requests.csv
 
 # n-gram self-speculation (no draft model) - most useful when outputs repeat prompt content (code, RAG, edits)
-mpirun -np 12 ./build/llama_mpi_disagg -m model.gguf -p prompts.jsonl --spec-type ngram-mod
+mpirun -np 12 ./build/vibeprof_llm -m model.gguf -p prompts.jsonl --spec-type ngram-mod
 
 # draft model; with temp > 0 use rejection sampling (see "Speculative decoding" below)
-mpirun -np 12 ./build/llama_mpi_disagg -m llama-3.1-8b.gguf -md llama-3.2-1b.gguf --spec-draft-max 8 \
+mpirun -np 12 ./build/vibeprof_llm -m llama-3.1-8b.gguf -md llama-3.2-1b.gguf --spec-draft-max 8 \
        -p prompts.jsonl --temp 0.7 --spec-rejection
 
 # GPU decode with large batches: 4 GPUs -> 2 prefill GPUs + 2 decode GPUs (128 seqs each) + 8 CPU decode ranks
-mpirun -np 12 ./build/llama_mpi_disagg -m model.gguf -p prompts.jsonl --decode-gpus 2 --decode-batch-gpu 128
+mpirun -np 12 ./build/vibeprof_llm -m model.gguf -p prompts.jsonl --decode-gpus 2 --decode-batch-gpu 128
 
 # Slurm, 2 nodes x 8 ranks, decode ranks bound to disjoint cores
-srun -N2 --ntasks-per-node=8 --cpu-bind=cores ./build/llama_mpi_disagg -m model.gguf -n 2000 --isl 512 --osl 128
+srun -N2 --ntasks-per-node=8 --cpu-bind=cores ./build/vibeprof_llm -m model.gguf -n 2000 --isl 512 --osl 128
 ```
 
 ### Options
@@ -337,16 +353,16 @@ template; a second "draft" with the same vocabulary and different weights).
     512-token request.
   - **Not run:** real GPU buffers, pinned staging, and GPU-aware MPI (device pointers in `MPI_Isend`/`MPI_Irecv`).
 * **GPU decode** was tested for layout, per-class capacities, routing, sharing and validation errors using
-  `LLAMA_MPI_EMULATE_GPUS=1 --gpus-per-node N`. This is a test hook that keeps the GPU role assignment but runs
+  `VIBEPROF_LLM_EMULATE_GPUS=1 --gpus-per-node N`. This is a test hook that keeps the GPU role assignment but runs
   those ranks on the CPU. The build machine has no GPU, so **actual GPU execution (prefill or decode) has not
   been run**.
 
 ```bash
 PYTHONPATH=../llama.cpp/gguf-py python3 tools/make_tiny_gguf.py tiny.gguf --chat-template
 PYTHONPATH=../llama.cpp/gguf-py python3 tools/make_tiny_gguf.py draft.gguf --layers 2 --seed 7
-mpirun -np 4 ./build/llama_mpi_disagg -m tiny.gguf -md tiny.gguf -n 24 --isl 80 --osl 40 -c 256 --temp 0 --verify
-mpirun -np 3 ./build/llama_mpi_disagg -m tiny.gguf -p examples/prompts_chat.jsonl --osl-from-data -c 512 --output out.jsonl
-LLAMA_MPI_EMULATE_GPUS=1 mpirun -np 6 ./build/llama_mpi_disagg -m tiny.gguf --gpus-per-node 2 --decode-gpus 1 -n 60 -c 256
+mpirun -np 4 ./build/vibeprof_llm -m tiny.gguf -md tiny.gguf -n 24 --isl 80 --osl 40 -c 256 --temp 0 --verify
+mpirun -np 3 ./build/vibeprof_llm -m tiny.gguf -p examples/prompts_chat.jsonl --osl-from-data -c 512 --output out.jsonl
+VIBEPROF_LLM_EMULATE_GPUS=1 mpirun -np 6 ./build/vibeprof_llm -m tiny.gguf --gpus-per-node 2 --decode-gpus 1 -n 60 -c 256
 ```
 
 ## Notes and limits

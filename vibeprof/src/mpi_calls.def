@@ -1,0 +1,145 @@
+/*
+ * Table of wrapped MPI calls (X-macro), shared by the collector and the perturbation library.
+ *
+ *   X(NAME, PARAMS, ARGS, COMM, BYTES, PEER, KIND)
+ *
+ *   PARAMS  parameter list exactly as in mpi.h (MPI-3.1 signatures)
+ *   ARGS    argument list to forward
+ *   COMM    communicator expression (MPI_COMM_NULL if none)
+ *   BYTES   payload bytes attributed to this rank (evaluated after the call; collector only)
+ *   PEER    destination rank in COMM for sends, else -1 (collector only)
+ *   KIND    K_SEND, K_RECV, K_SENDRECV, K_WAIT, K_COLL, K_ICOLL, K_PROBE, K_RMA, K_RMASYNC
+ *
+ * MPI_Send and MPI_Isend are listed separately in mpi_calls_send.def because the perturbation
+ * library replaces them by hand.
+ */
+
+/* ---- point-to-point ---- */
+X(Ssend,  (const void *buf, int count, MPI_Datatype datatype, int dest, int tag, MPI_Comm comm),
+          (buf, count, datatype, dest, tag, comm), comm, tsz(count, datatype), dest, K_SEND)
+X(Rsend,  (const void *buf, int count, MPI_Datatype datatype, int dest, int tag, MPI_Comm comm),
+          (buf, count, datatype, dest, tag, comm), comm, tsz(count, datatype), dest, K_SEND)
+X(Bsend,  (const void *buf, int count, MPI_Datatype datatype, int dest, int tag, MPI_Comm comm),
+          (buf, count, datatype, dest, tag, comm), comm, tsz(count, datatype), dest, K_SEND)
+X(Issend, (const void *buf, int count, MPI_Datatype datatype, int dest, int tag, MPI_Comm comm, MPI_Request *request),
+          (buf, count, datatype, dest, tag, comm, request), comm, tsz(count, datatype), dest, K_SEND)
+X(Irsend, (const void *buf, int count, MPI_Datatype datatype, int dest, int tag, MPI_Comm comm, MPI_Request *request),
+          (buf, count, datatype, dest, tag, comm, request), comm, tsz(count, datatype), dest, K_SEND)
+X(Ibsend, (const void *buf, int count, MPI_Datatype datatype, int dest, int tag, MPI_Comm comm, MPI_Request *request),
+          (buf, count, datatype, dest, tag, comm, request), comm, tsz(count, datatype), dest, K_SEND)
+X(Recv,   (void *buf, int count, MPI_Datatype datatype, int source, int tag, MPI_Comm comm, MPI_Status *status),
+          (buf, count, datatype, source, tag, comm, status), comm, tsz(count, datatype), -1, K_RECV)
+X(Irecv,  (void *buf, int count, MPI_Datatype datatype, int source, int tag, MPI_Comm comm, MPI_Request *request),
+          (buf, count, datatype, source, tag, comm, request), comm, tsz(count, datatype), -1, K_RECV)
+X(Sendrecv, (const void *sendbuf, int sendcount, MPI_Datatype sendtype, int dest, int sendtag, void *recvbuf, int recvcount,
+             MPI_Datatype recvtype, int source, int recvtag, MPI_Comm comm, MPI_Status *status),
+          (sendbuf, sendcount, sendtype, dest, sendtag, recvbuf, recvcount, recvtype, source, recvtag, comm, status),
+          comm, tsz(sendcount, sendtype), dest, K_SENDRECV)
+X(Sendrecv_replace, (void *buf, int count, MPI_Datatype datatype, int dest, int sendtag, int source, int recvtag,
+                     MPI_Comm comm, MPI_Status *status),
+          (buf, count, datatype, dest, sendtag, source, recvtag, comm, status), comm, tsz(count, datatype), dest, K_SENDRECV)
+X(Probe,  (int source, int tag, MPI_Comm comm, MPI_Status *status), (source, tag, comm, status), comm, 0, -1, K_PROBE)
+X(Iprobe, (int source, int tag, MPI_Comm comm, int *flag, MPI_Status *status), (source, tag, comm, flag, status), comm, 0, -1, K_PROBE)
+
+/* ---- completion ---- */
+X(Wait,     (MPI_Request *request, MPI_Status *status), (request, status), MPI_COMM_NULL, 0, -1, K_WAIT)
+X(Waitall,  (int count, MPI_Request array_of_requests[], MPI_Status array_of_statuses[]),
+            (count, array_of_requests, array_of_statuses), MPI_COMM_NULL, 0, -1, K_WAIT)
+X(Waitany,  (int count, MPI_Request array_of_requests[], int *indx, MPI_Status *status),
+            (count, array_of_requests, indx, status), MPI_COMM_NULL, 0, -1, K_WAIT)
+X(Waitsome, (int incount, MPI_Request array_of_requests[], int *outcount, int array_of_indices[], MPI_Status array_of_statuses[]),
+            (incount, array_of_requests, outcount, array_of_indices, array_of_statuses), MPI_COMM_NULL, 0, -1, K_WAIT)
+X(Test,     (MPI_Request *request, int *flag, MPI_Status *status), (request, flag, status), MPI_COMM_NULL, 0, -1, K_WAIT)
+X(Testall,  (int count, MPI_Request array_of_requests[], int *flag, MPI_Status array_of_statuses[]),
+            (count, array_of_requests, flag, array_of_statuses), MPI_COMM_NULL, 0, -1, K_WAIT)
+X(Testany,  (int count, MPI_Request array_of_requests[], int *indx, int *flag, MPI_Status *status),
+            (count, array_of_requests, indx, flag, status), MPI_COMM_NULL, 0, -1, K_WAIT)
+X(Testsome, (int incount, MPI_Request array_of_requests[], int *outcount, int array_of_indices[], MPI_Status array_of_statuses[]),
+            (incount, array_of_requests, outcount, array_of_indices, array_of_statuses), MPI_COMM_NULL, 0, -1, K_WAIT)
+
+/* ---- blocking collectives ---- */
+X(Barrier,   (MPI_Comm comm), (comm), comm, 0, -1, K_COLL)
+X(Bcast,     (void *buffer, int count, MPI_Datatype datatype, int root, MPI_Comm comm),
+             (buffer, count, datatype, root, comm), comm, tsz(count, datatype), -1, K_COLL)
+X(Reduce,    (const void *sendbuf, void *recvbuf, int count, MPI_Datatype datatype, MPI_Op op, int root, MPI_Comm comm),
+             (sendbuf, recvbuf, count, datatype, op, root, comm), comm, tsz(count, datatype), -1, K_COLL)
+X(Allreduce, (const void *sendbuf, void *recvbuf, int count, MPI_Datatype datatype, MPI_Op op, MPI_Comm comm),
+             (sendbuf, recvbuf, count, datatype, op, comm), comm, tsz(count, datatype), -1, K_COLL)
+X(Gather,    (const void *sendbuf, int sendcount, MPI_Datatype sendtype, void *recvbuf, int recvcount, MPI_Datatype recvtype,
+              int root, MPI_Comm comm),
+             (sendbuf, sendcount, sendtype, recvbuf, recvcount, recvtype, root, comm), comm, tsz(sendcount, sendtype), -1, K_COLL)
+X(Gatherv,   (const void *sendbuf, int sendcount, MPI_Datatype sendtype, void *recvbuf, const int recvcounts[], const int displs[],
+              MPI_Datatype recvtype, int root, MPI_Comm comm),
+             (sendbuf, sendcount, sendtype, recvbuf, recvcounts, displs, recvtype, root, comm), comm, tsz(sendcount, sendtype), -1, K_COLL)
+X(Scatter,   (const void *sendbuf, int sendcount, MPI_Datatype sendtype, void *recvbuf, int recvcount, MPI_Datatype recvtype,
+              int root, MPI_Comm comm),
+             (sendbuf, sendcount, sendtype, recvbuf, recvcount, recvtype, root, comm), comm, tsz(recvcount, recvtype), -1, K_COLL)
+X(Scatterv,  (const void *sendbuf, const int sendcounts[], const int displs[], MPI_Datatype sendtype, void *recvbuf, int recvcount,
+              MPI_Datatype recvtype, int root, MPI_Comm comm),
+             (sendbuf, sendcounts, displs, sendtype, recvbuf, recvcount, recvtype, root, comm), comm, tsz(recvcount, recvtype), -1, K_COLL)
+X(Allgather, (const void *sendbuf, int sendcount, MPI_Datatype sendtype, void *recvbuf, int recvcount, MPI_Datatype recvtype,
+              MPI_Comm comm),
+             (sendbuf, sendcount, sendtype, recvbuf, recvcount, recvtype, comm), comm, tsz(sendcount, sendtype), -1, K_COLL)
+X(Allgatherv, (const void *sendbuf, int sendcount, MPI_Datatype sendtype, void *recvbuf, const int recvcounts[], const int displs[],
+               MPI_Datatype recvtype, MPI_Comm comm),
+             (sendbuf, sendcount, sendtype, recvbuf, recvcounts, displs, recvtype, comm), comm, tsz(sendcount, sendtype), -1, K_COLL)
+X(Alltoall,  (const void *sendbuf, int sendcount, MPI_Datatype sendtype, void *recvbuf, int recvcount, MPI_Datatype recvtype,
+              MPI_Comm comm),
+             (sendbuf, sendcount, sendtype, recvbuf, recvcount, recvtype, comm), comm, tsz(sendcount, sendtype) * csz(comm), -1, K_COLL)
+X(Alltoallv, (const void *sendbuf, const int sendcounts[], const int sdispls[], MPI_Datatype sendtype, void *recvbuf,
+              const int recvcounts[], const int rdispls[], MPI_Datatype recvtype, MPI_Comm comm),
+             (sendbuf, sendcounts, sdispls, sendtype, recvbuf, recvcounts, rdispls, recvtype, comm), comm,
+             vsz(sendcounts, sendtype, comm), -1, K_COLL)
+X(Reduce_scatter, (const void *sendbuf, void *recvbuf, const int recvcounts[], MPI_Datatype datatype, MPI_Op op, MPI_Comm comm),
+             (sendbuf, recvbuf, recvcounts, datatype, op, comm), comm, vsz(recvcounts, datatype, comm), -1, K_COLL)
+X(Reduce_scatter_block, (const void *sendbuf, void *recvbuf, int recvcount, MPI_Datatype datatype, MPI_Op op, MPI_Comm comm),
+             (sendbuf, recvbuf, recvcount, datatype, op, comm), comm, tsz(recvcount, datatype) * csz(comm), -1, K_COLL)
+X(Scan,      (const void *sendbuf, void *recvbuf, int count, MPI_Datatype datatype, MPI_Op op, MPI_Comm comm),
+             (sendbuf, recvbuf, count, datatype, op, comm), comm, tsz(count, datatype), -1, K_COLL)
+X(Exscan,    (const void *sendbuf, void *recvbuf, int count, MPI_Datatype datatype, MPI_Op op, MPI_Comm comm),
+             (sendbuf, recvbuf, count, datatype, op, comm), comm, tsz(count, datatype), -1, K_COLL)
+X(Neighbor_alltoall, (const void *sendbuf, int sendcount, MPI_Datatype sendtype, void *recvbuf, int recvcount,
+                      MPI_Datatype recvtype, MPI_Comm comm),
+             (sendbuf, sendcount, sendtype, recvbuf, recvcount, recvtype, comm), comm, tsz(sendcount, sendtype), -1, K_COLL)
+
+/* ---- nonblocking collectives (time here is posting cost; completion shows up in Wait*) ---- */
+X(Ibarrier,   (MPI_Comm comm, MPI_Request *request), (comm, request), comm, 0, -1, K_ICOLL)
+X(Ibcast,     (void *buffer, int count, MPI_Datatype datatype, int root, MPI_Comm comm, MPI_Request *request),
+              (buffer, count, datatype, root, comm, request), comm, tsz(count, datatype), -1, K_ICOLL)
+X(Ireduce,    (const void *sendbuf, void *recvbuf, int count, MPI_Datatype datatype, MPI_Op op, int root, MPI_Comm comm,
+               MPI_Request *request),
+              (sendbuf, recvbuf, count, datatype, op, root, comm, request), comm, tsz(count, datatype), -1, K_ICOLL)
+X(Iallreduce, (const void *sendbuf, void *recvbuf, int count, MPI_Datatype datatype, MPI_Op op, MPI_Comm comm, MPI_Request *request),
+              (sendbuf, recvbuf, count, datatype, op, comm, request), comm, tsz(count, datatype), -1, K_ICOLL)
+X(Iallgather, (const void *sendbuf, int sendcount, MPI_Datatype sendtype, void *recvbuf, int recvcount, MPI_Datatype recvtype,
+               MPI_Comm comm, MPI_Request *request),
+              (sendbuf, sendcount, sendtype, recvbuf, recvcount, recvtype, comm, request), comm, tsz(sendcount, sendtype), -1, K_ICOLL)
+X(Ialltoall,  (const void *sendbuf, int sendcount, MPI_Datatype sendtype, void *recvbuf, int recvcount, MPI_Datatype recvtype,
+               MPI_Comm comm, MPI_Request *request),
+              (sendbuf, sendcount, sendtype, recvbuf, recvcount, recvtype, comm, request), comm,
+              tsz(sendcount, sendtype) * csz(comm), -1, K_ICOLL)
+X(Ialltoallv, (const void *sendbuf, const int sendcounts[], const int sdispls[], MPI_Datatype sendtype, void *recvbuf,
+               const int recvcounts[], const int rdispls[], MPI_Datatype recvtype, MPI_Comm comm, MPI_Request *request),
+              (sendbuf, sendcounts, sdispls, sendtype, recvbuf, recvcounts, rdispls, recvtype, comm, request), comm,
+              vsz(sendcounts, sendtype, comm), -1, K_ICOLL)
+
+/* ---- one-sided ---- */
+X(Put,        (const void *origin_addr, int origin_count, MPI_Datatype origin_datatype, int target_rank, MPI_Aint target_disp,
+               int target_count, MPI_Datatype target_datatype, MPI_Win win),
+              (origin_addr, origin_count, origin_datatype, target_rank, target_disp, target_count, target_datatype, win),
+              MPI_COMM_NULL, tsz(origin_count, origin_datatype), -1, K_RMA)
+X(Get,        (void *origin_addr, int origin_count, MPI_Datatype origin_datatype, int target_rank, MPI_Aint target_disp,
+               int target_count, MPI_Datatype target_datatype, MPI_Win win),
+              (origin_addr, origin_count, origin_datatype, target_rank, target_disp, target_count, target_datatype, win),
+              MPI_COMM_NULL, tsz(origin_count, origin_datatype), -1, K_RMA)
+X(Accumulate, (const void *origin_addr, int origin_count, MPI_Datatype origin_datatype, int target_rank, MPI_Aint target_disp,
+               int target_count, MPI_Datatype target_datatype, MPI_Op op, MPI_Win win),
+              (origin_addr, origin_count, origin_datatype, target_rank, target_disp, target_count, target_datatype, op, win),
+              MPI_COMM_NULL, tsz(origin_count, origin_datatype), -1, K_RMA)
+X(Fetch_and_op, (const void *origin_addr, void *result_addr, MPI_Datatype datatype, int target_rank, MPI_Aint target_disp,
+                 MPI_Op op, MPI_Win win),
+              (origin_addr, result_addr, datatype, target_rank, target_disp, op, win), MPI_COMM_NULL, tsz(1, datatype), -1, K_RMA)
+X(Win_fence,  (int assert, MPI_Win win), (assert, win), MPI_COMM_NULL, 0, -1, K_RMASYNC)
+X(Win_flush,  (int rank, MPI_Win win), (rank, win), MPI_COMM_NULL, 0, -1, K_RMASYNC)
+X(Win_lock,   (int lock_type, int rank, int assert, MPI_Win win), (lock_type, rank, assert, win), MPI_COMM_NULL, 0, -1, K_RMASYNC)
+X(Win_unlock, (int rank, MPI_Win win), (rank, win), MPI_COMM_NULL, 0, -1, K_RMASYNC)

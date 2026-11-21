@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# vibeprof-srun - profile an unmodified MPI application, then build the report.
+#
+#   vibeprof-srun [options] -- srun   -N 4 -n 128 ./app args...
+#   vibeprof-srun [options] -- mpirun -np 8 ./app args...
+#
+# The collector is injected with LD_PRELOAD through the launcher's own environment option
+# (srun --export, Open MPI -x, MPICH/Hydra -genv), so the launcher process itself is not
+# profiled. After the job step ends, vibeprof_report.py writes PROFILE/analysis/{report.html,
+# report.md, brief.md, ...}.
+#
+# Options:
+#   -o, --out DIR        profile directory (default: vibeprof-<jobid>.<step> or vibeprof-<time>-<pid>)
+#   --lib PATH[:PATH]    library/preload list (default: $VIBEPROF_LIB or ../build/libvibeprof.so);
+#                        prepend libvibeperturb.so to inject faults for testing
+#   --no-report          only collect; analyze later with tools/vibeprof_report.py DIR
+#   --png                also write PNG figures
+#   --brief              short interpretation (verdict, top issues, suggestions)
+#   --model GGUF         let an LLM write the interpretation (runs vibeprof_llm)
+#   --llm-launcher CMD   launcher for the LLM step (default: "srun -n 2 --overlap" inside an
+#                        allocation, else "mpirun -np 2")
+#   --report-args STR    extra arguments for vibeprof_report.py, e.g. "--map-reduce --ctx 16384"
+#   --gpu MODE           GPU measurement: auto (default: on when NVIDIA GPUs and CUPTI are found),
+#                        cuda (warn if unavailable) or none
+#   --kokkos             Kokkos applications: set KOKKOS_TOOLS_LIBS so Kokkos profile regions become
+#                        phases and Kokkos kernel labels name the GPU kernels
+#   -h, --help
+#
+# Environment passed through to the ranks: VIBEPROF=0 (disable), VIBEPROF_MAX_INSTANCES,
+# VIBEPROF_CUPTI_LIB / VIBEPROF_CUDA_LIB (library locations), VIBEPROF_GPU_API=0,
+# VIBEPROF_FAKE_PPN (testing only). Phase markers need libvibeprof.h calls in the application;
+# without them the report still covers MPI calls, call sites, ranks, nodes, traffic and GPU use.
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+root="$(cd "$here/.." && pwd)"
+lib="${VIBEPROF_LIB:-$root/build/libvibeprof.so}"
+out=""; report=1; rargs=(); llm_launcher="${VIBEPROF_LLM_LAUNCHER:-}"; extra=""; gpu=""; kokkos=0
+
+usage() { sed -n '2,/^set -e/p' "$0" | sed '$d;s/^# \{0,1\}//'; exit "${1:-0}"; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o|--out)        out="$2"; shift 2 ;;
+    --lib)           lib="$2"; shift 2 ;;
+    --no-report)     report=0; shift ;;
+    --png|--brief|--map-reduce) rargs+=("$1"); shift ;;
+    --model)         rargs+=(--model "$2"); shift 2 ;;
+    --llm-launcher)  llm_launcher="$2"; shift 2 ;;
+    --report-args)   extra="$2"; shift 2 ;;
+    --gpu)           gpu="$2"; shift 2 ;;
+    --kokkos)        kokkos=1; shift ;;
+    -h|--help)       usage 0 ;;
+    --)              shift; break ;;
+    *)               echo "vibeprof-srun: unknown option $1 (did you forget '--' before the launcher?)" >&2; usage 2 ;;
+  esac
+done
+[[ $# -ge 2 ]] || { echo "vibeprof-srun: expected '-- <launcher> [launcher args] <app> [app args]'" >&2; usage 2; }
+# --lib may be a colon-separated preload list, e.g. "libvibeperturb.so:libvibeprof.so" (fault injection)
+abs=()
+IFS=: read -r -a parts <<< "$lib"
+for p in "${parts[@]}"; do
+  [[ -f "$p" ]] || { echo "vibeprof-srun: library not found: $p (build vibeprof or set VIBEPROF_LIB)" >&2; exit 2; }
+  abs+=("$(cd "$(dirname "$p")" && pwd)/$(basename "$p")")
+done
+lib="$(IFS=:; echo "${abs[*]}")"
+
+if [[ -z "$out" ]]; then
+  if [[ -n "${SLURM_JOB_ID:-}" ]]; then out="vibeprof-${SLURM_JOB_ID}.$(date +%H%M%S)"; else out="vibeprof-$(date +%Y%m%d-%H%M%S)-$$"; fi
+fi
+mkdir -p "$out"; out="$(cd "$out" && pwd)"
+
+# variables for the ranks: the preload, the profile directory, and the vibeprof settings in effect
+vars=("LD_PRELOAD=$lib" "VIBEPROF_DIR=$out")
+[[ -n "$gpu" ]] && vars+=("VIBEPROF_GPU=$gpu")
+[[ $kokkos -eq 1 ]] && vars+=("KOKKOS_TOOLS_LIBS=${abs[${#abs[@]}-1]}")
+for v in VIBEPROF VIBEPROF_MAX_INSTANCES VIBEPROF_CUPTI_LIB VIBEPROF_CUDA_LIB VIBEPROF_GPU_API VIBEPROF_KOKKOS_KERNELS VIBEPROF_FAKE_PPN; do
+  [[ -n "${!v:-}" ]] && vars+=("$v=${!v}")
+done
+
+launcher="$1"; shift
+name="$(basename "$launcher")"
+case "$name" in
+  srun)
+    exp="ALL"; for kv in "${vars[@]}"; do exp+=",$kv"; done
+    cmd=("$launcher" "--export=$exp" "$@") ;;
+  mpirun|mpiexec|mpiexec.hydra|orterun|prterun)
+    cmd=("$launcher")
+    if "$launcher" --version 2>&1 | grep -qiE "open mpi|openrte|prrte"; then
+      for kv in "${vars[@]}"; do cmd+=(-x "$kv"); done
+    else
+      for kv in "${vars[@]}"; do cmd+=(-genv "${kv%%=*}" "${kv#*=}"); done
+    fi
+    cmd+=("$@") ;;
+  *)
+    echo "vibeprof-srun: unknown launcher '$name'; setting LD_PRELOAD for the launcher itself" >&2
+    cmd=(env "${vars[@]}" "$launcher" "$@") ;;
+esac
+
+echo "vibeprof-srun: profile -> $out" >&2
+set +e
+"${cmd[@]}"
+rc=$?
+set -e
+[[ $rc -eq 0 ]] || echo "vibeprof-srun: application exited with status $rc" >&2
+
+if [[ $report -eq 1 ]]; then
+  if ! compgen -G "$out/rank-*.json" > /dev/null; then
+    echo "vibeprof-srun: no rank profiles in $out (was the application linked against the same MPI ABI?)" >&2
+    exit $(( rc ? rc : 3 ))
+  fi
+  if [[ -z "$llm_launcher" ]]; then
+    if [[ -n "${SLURM_JOB_ID:-}" ]]; then llm_launcher="srun -n 2 --overlap"; else llm_launcher="mpirun -np 2"; fi
+  fi
+  # shellcheck disable=SC2086
+  python3 "$root/tools/vibeprof_report.py" "$out" --launcher "$llm_launcher" "${rargs[@]}" $extra
+fi
+exit $rc

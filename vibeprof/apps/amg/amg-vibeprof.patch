@@ -1,0 +1,44 @@
+diff --git a/test/amg.c b/test/amg.c
+index 18811ea..d487a6c 100644
+--- a/test/amg.c
++++ b/test/amg.c
+@@ -22,6 +22,7 @@
+  * works by first building a parcsr matrix as before and then "copying"
+  * that matrix row-by-row into the IJMatrix interface. AJC 7/99.
+  *--------------------------------------------------------------------------*/
++#include <vibeprof.h>
+ #include <stdlib.h>
+ #include <stdio.h>
+ #include <math.h>
+@@ -270,7 +271,9 @@ main( hypre_int argc,
+    time_index = hypre_InitializeTiming("Spatial Operator");
+    hypre_BeginTiming(time_index);
+ 
++   vibeprof_phase_begin("build");
+    BuildIJLaplacian27pt(argc, argv, &system_size, &ij_A);
++   vibeprof_phase_end("build");
+    HYPRE_IJMatrixGetObject(ij_A, &object);
+    parcsr_A = (HYPRE_ParCSRMatrix) object;
+ 
+@@ -392,8 +395,10 @@ main( hypre_int argc,
+          if (myid == 0 && print_stats)
+             hypre_printf("HYPRE_ParCSRPCGGetPrecond got good precond\n");
+ 
++      vibeprof_phase_begin("amg_setup");
+       HYPRE_PCGSetup(pcg_solver, (HYPRE_Matrix)parcsr_A, 
+                      (HYPRE_Vector)b, (HYPRE_Vector)x);
++      vibeprof_phase_end("amg_setup");
+ 
+       hypre_MPI_Barrier(hypre_MPI_COMM_WORLD);
+       hypre_EndTiming(time_index);
+@@ -413,8 +418,10 @@ main( hypre_int argc,
+       hypre_MPI_Barrier(hypre_MPI_COMM_WORLD);
+       hypre_BeginTiming(time_index);
+  
++      vibeprof_phase_begin("pcg_solve");
+       HYPRE_PCGSolve(pcg_solver, (HYPRE_Matrix)parcsr_A, 
+                      (HYPRE_Vector)b, (HYPRE_Vector)x);
++      vibeprof_phase_end("pcg_solve");
+  
+       hypre_MPI_Barrier(hypre_MPI_COMM_WORLD);
+       hypre_EndTiming(time_index);

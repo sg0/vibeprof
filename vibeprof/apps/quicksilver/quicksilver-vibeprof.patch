@@ -1,0 +1,37 @@
+diff --git a/src/main.cc b/src/main.cc
+index 765ef62..ef3352e 100644
+--- a/src/main.cc
++++ b/src/main.cc
+@@ -18,6 +18,7 @@
+ #include "NVTX_Range.hh"
+ #include "cudaUtils.hh"
+ #include "cudaFunctions.hh"
++#include <vibeprof.h>
+ #include "qs_assert.hh"
+ #include "CycleTracking.hh"
+ #include "CoralBenchmark.hh"
+@@ -44,7 +45,9 @@ int main(int argc, char** argv)
+    printParameters(params, cout);
+ 
+    // mcco stores just about everything. 
++   vibeprof_phase_begin("init");
+    mcco = initMC(params); 
++   vibeprof_phase_end("init");
+ 
+    int loadBalance = params.simulationParams.loadBalance;
+ 
+@@ -54,9 +57,11 @@ int main(int argc, char** argv)
+ 
+    for (int ii=0; ii<nSteps; ++ii)
+    {
+-      cycleInit( bool(loadBalance) );
+-      cycleTracking(mcco);
+-      cycleFinalize();
++      vibeprof_phase_begin("cycle");
++      { VIBEPROF_SCOPE("init"); cycleInit( bool(loadBalance) ); }
++      { VIBEPROF_SCOPE("tracking"); cycleTracking(mcco); }
++      { VIBEPROF_SCOPE("finalize"); cycleFinalize(); }
++      vibeprof_phase_end("cycle");
+ 
+       mcco->fast_timer->Last_Cycle_Report(
+             params.simulationParams.cycleTimers,

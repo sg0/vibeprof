@@ -1,4 +1,4 @@
-// llama_mpi_disagg.cpp
+// vibeprof_llm.cpp
 //
 // MPI wrapper around llama.cpp (linked statically, used in-process; no server) that runs
 // continuously batched, disaggregated prefill/decode inference on synthetic or real prompts:
@@ -998,9 +998,9 @@ static std::vector<ggml_backend_dev_t> gpu_devices() {
     return v;
 }
 
-// Testing hook: LLAMA_MPI_EMULATE_GPUS=1 keeps GPU role/device assignment (layout, capacities,
+// Testing hook: VIBEPROF_LLM_EMULATE_GPUS=1 keeps GPU role/device assignment (layout, capacities,
 // routing, report) but runs those ranks on the CPU, so GPU topologies can be exercised anywhere.
-static bool emulate_gpus() { const char * e = getenv("LLAMA_MPI_EMULATE_GPUS"); return e && atoi(e) != 0; }
+static bool emulate_gpus() { const char * e = getenv("VIBEPROF_LLM_EMULATE_GPUS"); return e && atoi(e) != 0; }
 
 // Loads a model on one GPU (dev >= 0) or CPU only (dev < 0).
 static llama_model * load_model(const std::string & path, int dev, int ngl) {
@@ -2069,7 +2069,7 @@ int main(int argc, char ** argv) {
     //   local ranks [0, Pp)        prefill   (GPU i for i < Pg, CPU beyond)
     //   local ranks [Pp, Pp + Dg)  decode on GPU (Pg + j) % ngpu
     //   remaining local ranks      decode on CPU
-    if (emulate_gpus() && a.gpus_per_node < 0) fatal("LLAMA_MPI_EMULATE_GPUS needs --gpus-per-node");
+    if (emulate_gpus() && a.gpus_per_node < 0) fatal("VIBEPROF_LLM_EMULATE_GPUS needs --gpus-per-node");
     const int Dg = std::max(0, a.decode_gpus);
     if (Dg > 0 && ngpu == 0) fatal("--decode-gpus %d requested but no GPUs were detected (see --gpus-per-node)", Dg);
     const int Pg = a.prefill_gpus >= 0 ? std::min(a.prefill_gpus, ngpu) : (ngpu == 0 ? 0 : (Dg < ngpu ? ngpu - Dg : ngpu));
