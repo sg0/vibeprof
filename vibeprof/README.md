@@ -164,6 +164,38 @@ validated: every `[M#]`/`[F#]` must exist and every number must occur in the dat
 shown under the text, and text without citations is flagged as ungrounded. Use an instruction-
 tuned model of 7B parameters or more; small models do not follow the citation rules.
 
+**Getting a model.** Download a single-file GGUF once, e.g. Qwen2.5-7B-Instruct Q4_K_M (4.7 GB). On clusters,
+do this on a login node (compute nodes often have no internet) into project storage rather than `$HOME`:
+
+```bash
+mkdir -p /path/to/models && cd /path/to/models
+curl -L -o Qwen2.5-7B-Instruct-Q4_K_M.gguf \
+  https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf
+# or: hf download bartowski/Qwen2.5-7B-Instruct-GGUF Qwen2.5-7B-Instruct-Q4_K_M.gguf --local-dir /path/to/models
+```
+
+and pass `--model /path/to/models/Qwen2.5-7B-Instruct-Q4_K_M.gguf`. Single-file repositories are simplest; some
+official GGUF repositories (e.g. `Qwen/Qwen2.5-7B-Instruct-GGUF`) split larger quantizations into parts.
+
+**Automatic download.** `--model` also takes a Hugging Face file, fetched on first use and cached:
+
+```bash
+--model hf:bartowski/Qwen2.5-7B-Instruct-GGUF/Qwen2.5-7B-Instruct-Q4_K_M.gguf     # optional @revision suffix
+```
+
+Files go to `$VIBEPROF_MODEL_DIR` (default `~/.cache/vibeprof/models`); split models fetch every part (name
+the first one); interrupted downloads resume; `HF_TOKEN` is sent for gated models and `https_proxy` is honored.
+The report step runs where `vibeprof-srun` runs, usually a compute node, so either pre-fetch on a login node
+with the same cache directory:
+
+```bash
+export VIBEPROF_MODEL_DIR=/path/to/models          # shared by login and compute nodes
+tools/vibeprof_model.py hf:bartowski/Qwen2.5-7B-Instruct-GGUF/Qwen2.5-7B-Instruct-Q4_K_M.gguf   # prints the path
+```
+
+or set the site proxy in the job (ALCF Polaris: `export https_proxy=http://proxy.alcf.anl.gov:3128`).
+`tools/vibeprof_model.py` also works for the engine directly: `vibeprof_llm -m "$(tools/vibeprof_model.py hf:...)"`.
+
 ## Validation
 
 Ground truth comes from `libvibeperturb.so`, preloaded before the collector

@@ -16,7 +16,8 @@
 #   --no-report          only collect; analyze later with tools/vibeprof_report.py DIR
 #   --png                also write PNG figures
 #   --brief              short interpretation (verdict, top issues, suggestions)
-#   --model GGUF         let an LLM write the interpretation (runs vibeprof_llm)
+#   --model GGUF         let an LLM write the interpretation (runs vibeprof_llm); a path, or
+#                        hf:<owner>/<repo>/<file.gguf>, downloaded once into $VIBEPROF_MODEL_DIR
 #   --llm-launcher CMD   launcher for the LLM step (default: "srun -n 2 --overlap" inside an
 #                        allocation, else "mpirun -np 2")
 #   --report-args STR    extra arguments for vibeprof_report.py, e.g. "--map-reduce --ctx 16384"

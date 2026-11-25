@@ -14,6 +14,7 @@ Examples:
   vibeprof_report.py $PROFILE                         # rule-based brief, plots
   vibeprof_report.py $PROFILE --brief --model m.gguf  # short LLM interpretation + suggestions
   vibeprof_report.py $PROFILE --model m.gguf --map-reduce --launcher "srun -n 4"
+  vibeprof_report.py $PROFILE --brief --model hf:bartowski/Qwen2.5-7B-Instruct-GGUF/Qwen2.5-7B-Instruct-Q4_K_M.gguf
 """
 import argparse
 import json
@@ -26,6 +27,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import vibeprof_analyze as LA  # noqa: E402
 import vibeprof_plot as LP  # noqa: E402
+import vibeprof_model  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_LLM_BIN = os.path.normpath(os.path.join(HERE, "..", "..", "build", "vibeprof_llm"))
@@ -123,7 +125,9 @@ def main():
     ap.add_argument("-o", "--out", help="output directory (default: PROFILE/analysis)")
     ap.add_argument("--png", action="store_true", help="also write static PNG figures")
     ap.add_argument("--brief", action="store_true", help="short interpretation: verdict + top issues + suggestions")
-    ap.add_argument("--model", help="GGUF model for the LLM interpretation (omit for the rule-based report only)")
+    ap.add_argument("--model", help="GGUF model for the LLM interpretation: a path, or hf:<owner>/<repo>/<file.gguf> "
+                                    "(downloaded once into $VIBEPROF_MODEL_DIR, default ~/.cache/vibeprof/models); "
+                                    "omit for the rule-based report only")
     ap.add_argument("--map-reduce", action="store_true", help="LLM: one note per top-level phase, then a combined report")
     ap.add_argument("--max-tokens", type=int, default=900)
     ap.add_argument("--llm-bin", default=DEFAULT_LLM_BIN, help="path to vibeprof_llm (default: %(default)s)")
@@ -150,6 +154,12 @@ def main():
     print("vibeprof: %d ranks, %d phases, %d findings -> %s" % (A["n_ranks"], len(A["phases"]), len(F), out))
 
     llm = None
+    if a.model:
+        try:
+            a.model = vibeprof_model.resolve(a.model)
+        except (ValueError, RuntimeError) as e:
+            print("vibeprof: model: %s - falling back to the rule-based brief" % e, file=sys.stderr)
+            a.model = None
     if a.model:
         try:
             if a.map_reduce and not a.brief:

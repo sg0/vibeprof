@@ -113,6 +113,11 @@ export PATH=$HOME/cmake-4.2.0-linux-x86_64/bin:$PATH
 
 ## Run
 
+Models are GGUF files; for a first test, a single-file download such as Qwen2.5-7B-Instruct Q4_K_M (4.7 GB):
+`curl -L -o Qwen2.5-7B-Instruct-Q4_K_M.gguf https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf`
+(on clusters, from a login node). `vibeprof/tools/vibeprof_model.py hf:<owner>/<repo>/<file.gguf>` downloads
+and caches one and prints its path (see [vibeprof/README.md](vibeprof/README.md#llm-interpretation)).
+
 ```bash
 # synthetic: 1 node, 4 GPUs, 12 ranks -> ranks 0-3 prefill on GPUs 0-3, ranks 4-11 decode on CPU cores
 mpirun -np 12 ./build/vibeprof_llm -m model.gguf -n 512 --isl 1024 --isl-std 256 --osl 256 --decode-batch 16
