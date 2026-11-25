@@ -74,6 +74,17 @@ If you patch by hand, note that `git -C ../llama.cpp apply PATCH` resolves `PATC
 so use an absolute path. CMake reports whether the split-state API was found. Without the patch everything else
 works, and KV transfer uses host memory.
 
+**If configuring fails** with `target_compile_features specified unknown feature ""` on llama.cpp's targets,
+check the `cmake` binary (e.g., a site-built CMake 4.5.1 on ALCF Polaris caused an issue), while the
+official Kitware binaries 3.18 through 4.5.1 configure cleanly. Use an official binary (unpack and run `bin/cmake`; 
+no install needed):
+
+```bash
+cd ~ && curl -LO https://github.com/Kitware/CMake/releases/download/v4.2.0/cmake-4.2.0-linux-x86_64.tar.gz
+tar xzf cmake-4.2.0-linux-x86_64.tar.gz
+cd /path/to/vibeprof && rm -rf build && ~/cmake-4.2.0-linux-x86_64/bin/cmake -S . -B build -DLLAMA_CPP_DIR=/path/to/llama.cpp
+```
+
 ## Run
 
 ```bash
