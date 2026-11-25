@@ -64,11 +64,15 @@ an MPI-3 library (MPICH, Open MPI, Cray MPICH, Intel MPI, MVAPICH…) and a C++1
 *KV transfer* below), apply the small llama.cpp patch before configuring:
 
 ```bash
-git -C ../llama.cpp apply ../vibeprof/patches/llama.cpp-state-seq-split.patch
+patches/apply.sh ../llama.cpp      # path to your llama.cpp checkout
 ```
 
-CMake reports whether the split-state API was found. Without the patch everything else works, and KV transfer
-uses host memory.
+The script is safe to run twice (an already patched tree is detected and left alone), cleans up `.rej` files
+from earlier attempts, and falls back to a 3-way merge when llama.cpp has moved on. The patch applies cleanly
+to llama.cpp from mid-June 2026 through `5917b39` (2026-11-25), and needs the 3-way merge for older checkouts.
+If you patch by hand, note that `git -C ../llama.cpp apply PATCH` resolves `PATCH` relative to `../llama.cpp`,
+so use an absolute path. CMake reports whether the split-state API was found. Without the patch everything else
+works, and KV transfer uses host memory.
 
 ## Run
 
@@ -343,7 +347,8 @@ template; a second "draft" with the same vocabulary and different weights).
   `max_tokens`, reference-answer lengths, shuffle with cycling, EOS stops (30 of 60 at temp 1), `--output` and
   CSV.
 * **KV transfer:**
-  - The patch applies cleanly to an unmodified llama.cpp `338fce6`, and the project builds with and without it.
+  - The patch applies cleanly to unmodified llama.cpp from mid-June 2026 through `5917b39` (2026-11-25), and the
+    project builds with and without it against `5917b39`; `--verify` is exact there with the patch built.
   - The split format was tested with its data half in CPU buffers, since there is no GPU here. That covers the
     patch's export/import code and the two-part messages. `--verify` was exact with flash attention off
     (f32 and f16 KV) and on (f16 and q8_0 KV, with matched KV size); with a draft model (100% acceptance, two
@@ -379,8 +384,9 @@ VIBEPROF_LLM_EMULATE_GPUS=1 mpirun -np 6 ./build/vibeprof_llm -m tiny.gguf --gpu
   sequences per GPU needs several decode ranks on that GPU.
 * Chat-templated prompts are tokenized as one string with special-token parsing on. Fine for benchmarking, but
   a serving system should not parse special tokens inside user content.
-* GPU-direct KV transfer needs the bundled llama.cpp patch, which targets llama.cpp `338fce6`. Newer checkouts
-  may need small adjustments. Without flash attention, llama.cpp stores V transposed and exports it row by
+* GPU-direct KV transfer needs the bundled llama.cpp patch (tested up to llama.cpp `5917b39`, 2026-11-25).
+  Future llama.cpp changes to the state-saving code may need small adjustments; `patches/apply.sh` tries a
+  3-way merge first. Without flash attention, llama.cpp stores V transposed and exports it row by
   row; on a GPU that means many small synchronized copies per request in both transports. Keep flash
   attention on (the default) for large transfers.
 * In-flight device staging buffers use GPU memory on the sender until the send completes, roughly one KV state
