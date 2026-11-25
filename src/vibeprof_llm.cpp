@@ -6,7 +6,7 @@
 //   * PREFILL ranks (normally one per GPU) pull work from a global task counter (NXTVAL,
 //     MPI-3 RMA MPI_Fetch_and_op on rank 0), build the prompt (synthetic generator, or a
 //     dataset record rendered with the model's chat template and tokenized), prefill one or
-//     more prompts per llama_decode(), sample the first token (TTFT), export the KV cache of
+//     more prompts per llama_process(), sample the first token (TTFT), export the KV cache of
 //     each sequence with llama_state_seq_get_data() and ship it to a decode rank. With a
 //     draft model, the draft is prefilled on the same device and its KV cache is shipped too.
 //   * DECODE ranks run continuous batching: up to N sequences live in one llama_context,
@@ -924,7 +924,7 @@ struct RankStat {
     int64_t requests;       // prefilled (prefill rank) or decoded (decode rank)
     int64_t tokens_in;      // prompt tokens processed
     int64_t tokens_out;     // tokens generated (first token counted on prefill side)
-    int64_t steps;          // llama_decode/llama_process calls in the timed region
+    int64_t steps;          // llama_process calls in the timed region
     double  busy;           // seconds inside llama.cpp compute + sampling
     double  wall;           // seconds from epoch to rank finish
     double  sum_batch;      // decode: sum of active sequences over steps
@@ -953,13 +953,10 @@ static constexpr uint64_t FNV0 = 0xcbf29ce484222325ULL;
 // llama.cpp helpers
 // ----------------------------------------------------------------------------
 
-static void batch_add(llama_batch & b, llama_token tok, llama_pos pos, llama_seq_id seq, bool logits) {
-    b.token[b.n_tokens]     = tok;
-    b.pos[b.n_tokens]       = pos;
-    b.n_seq_id[b.n_tokens]  = 1;
-    b.seq_id[b.n_tokens][0] = seq;
-    b.logits[b.n_tokens]    = logits;
-    b.n_tokens++;
+// Batches use llama.cpp's extended batch API (common_batch + llama_process). A batch belongs to the context it
+// was created for (it keeps that context's memory and vocabulary), so the draft model gets its own batch.
+static bool decode_batch(llama_context * ctx, common_batch & b) {
+    return llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, b.get()) == 0;
 }
 
 static llama_context * make_context(llama_model * model, const Args & a, int n_seq, int64_t n_cells, int n_batch,
@@ -1197,7 +1194,16 @@ static void run_prefill(const Args & a, llama_model * model, llama_model * model
     llama_memory_t mem = llama_get_memory(ctx);
     llama_context * ctx_dft = model_dft ? make_context(model_dft, a, B, (int64_t) a.ctx * B, n_batch, std::min(a.n_ubatch, n_batch), threads, !on_gpu) : nullptr;
     llama_memory_t mem_dft = ctx_dft ? llama_get_memory(ctx_dft) : nullptr;
-    llama_batch batch = llama_batch_init(n_batch, 0, 1);
+    common_batch batch(ctx);
+    common_batch batch_dft;
+    if (ctx_dft) batch_dft = common_batch(ctx_dft);
+    // the same tokens go to the target and (if any) the draft batch
+    auto add_both = [&](llama_token tok, llama_pos pos, llama_seq_id seq, bool out) {
+        const int32_t idx = batch.add(tok, pos, seq, out);
+        if (ctx_dft) batch_dft.add(tok, pos, seq, out);
+        return idx;
+    };
+    auto clear_both = [&]() { batch.clear(); if (ctx_dft) batch_dft.clear(); };
 
     PromptGen pg;
     pg.init(vocab, a);
@@ -1213,11 +1219,11 @@ static void run_prefill(const Args & a, llama_model * model, llama_model * model
     // warmup (not timed)
     for (int w = 0; w < a.warmup; ++w) {
         auto toks = pg.make(-1 - w, std::min(64, a.ctx - 1));
-        batch.n_tokens = 0;
-        for (int i = 0; i < (int) toks.size(); ++i) batch_add(batch, toks[i], i, 0, i + 1 == (int) toks.size());
-        if (llama_decode(ctx, batch) != 0) fatal("warmup prefill failed");
+        clear_both();
+        for (int i = 0; i < (int) toks.size(); ++i) add_both(toks[i], i, 0, i + 1 == (int) toks.size());
+        if (!decode_batch(ctx, batch)) fatal("warmup prefill failed");
         llama_memory_seq_rm(mem, 0, -1, -1);
-        if (ctx_dft) { if (llama_decode(ctx_dft, batch) != 0) fatal("warmup draft prefill failed"); llama_memory_seq_rm(mem_dft, 0, -1, -1); }
+        if (ctx_dft) { if (!decode_batch(ctx_dft, batch_dft)) fatal("warmup draft prefill failed"); llama_memory_seq_rm(mem_dft, 0, -1, -1); }
     }
 
     PrefillCtx P{&a, &gc, comm_ctl, comm_kv, decode_ranks, {}, {}, cap_seq, cap_cells, g_rank % (int) decode_ranks.size(), &st, {}, {}};
@@ -1296,16 +1302,16 @@ static void run_prefill(const Args & a, llama_model * model, llama_model * model
         std::vector<common_sampler *> smpl(nb);
         for (int s = 0; s < nb; ++s) smpl[s] = make_sampler(model, a, a.seed + (uint32_t) (tasks[s].id * 7919));
 
-        // pack all prompts into as few llama_decode calls as possible (target, then draft)
+        // pack all prompts into as few llama_process calls as possible (target, then draft)
         std::vector<int32_t> first_tok(nb, -1);
         std::vector<double>  t_first(nb, 0.0);
         const double t_pf = now_s();
-        batch.n_tokens = 0;
+        clear_both();
         std::vector<std::pair<int, int>> pending_logits;  // (seq, batch index)
         auto flush = [&]() {
-            if (batch.n_tokens == 0) return;
+            if (batch.size() == 0) return;
             const double tb = now_s();
-            if (llama_decode(ctx, batch) != 0) fatal("prefill llama_decode failed");
+            if (!decode_batch(ctx, batch)) fatal("prefill llama_process failed");
             for (auto [s, idx] : pending_logits) {
                 first_tok[s] = common_sampler_sample(smpl[s], ctx, idx);
                 common_sampler_accept(smpl[s], first_tok[s], true);
@@ -1314,21 +1320,21 @@ static void run_prefill(const Args & a, llama_model * model, llama_model * model
             st.busy += now_s() - tb;
             if (ctx_dft) {
                 const double td = now_s();
-                if (llama_decode(ctx_dft, batch) != 0) fatal("draft prefill llama_decode failed");
+                if (!decode_batch(ctx_dft, batch_dft)) fatal("draft prefill llama_process failed");
                 st.t_draft_prefill += now_s() - td;
                 st.busy += now_s() - td;
             }
             st.steps++;
             pending_logits.clear();
-            batch.n_tokens = 0;
+            clear_both();
         };
         for (int s = 0; s < nb; ++s) {
             const auto & p = tasks[s].toks;
             for (int i = 0; i < (int) p.size(); ++i) {
                 const bool last = (i + 1 == (int) p.size());
-                if (last) pending_logits.push_back({s, batch.n_tokens});
-                batch_add(batch, p[i], i, s, last);
-                if (batch.n_tokens == n_batch) flush();
+                const int32_t idx = add_both(p[i], i, s, last);
+                if (last) pending_logits.push_back({s, idx});
+                if (batch.size() == n_batch) flush();
             }
             st.tokens_in += (int64_t) p.size();
         }
@@ -1344,14 +1350,14 @@ static void run_prefill(const Args & a, llama_model * model, llama_model * model
                 ref = fnv1a(FNV0, first_tok[s]);
                 llama_token last = first_tok[s];
                 for (int k = 1; k < t.max_out && !(!a.ignore_eos && llama_vocab_is_eog(vocab, last)); ++k) {
-                    batch.n_tokens = 0;
-                    batch_add(batch, last, t.isl + k - 1, s, true);
-                    if (llama_decode(ctx, batch) != 0) fatal("verify decode failed");
+                    batch.clear();
+                    batch.add(last, t.isl + k - 1, s, true);
+                    if (!decode_batch(ctx, batch)) fatal("verify decode failed");
                     last = common_sampler_sample(smpl[s], ctx, 0);
                     common_sampler_accept(smpl[s], last, true);
                     ref = fnv1a(ref, last);
                 }
-                batch.n_tokens = 0;
+                batch.clear();
                 // reference decoding appended to the KV cache; restore the prompt-only state
                 llama_memory_seq_rm(mem, s, t.isl, -1);
             }
@@ -1438,7 +1444,8 @@ static void run_prefill(const Args & a, llama_model * model, llama_model * model
     P.hpool.free_all();
     P.dpool.free_all();
 
-    llama_batch_free(batch);
+    batch = common_batch();       // release the batches before their contexts
+    batch_dft = common_batch();
     if (ctx_dft) llama_free(ctx_dft);
     llama_free(ctx);
 }
@@ -1518,22 +1525,28 @@ static void run_decode(const Args & a, llama_model * model, llama_model * model_
 
     // warmup (not timed)
     {
-        llama_batch wb = llama_batch_init(std::max(M, 32), 0, 1);
+        common_batch wb(ctx);
+        common_batch wb_dft;
+        if (ctx_dft) wb_dft = common_batch(ctx_dft);
         const int nv = llama_vocab_n_tokens(vocab);
         for (int w = 0; w < a.warmup; ++w) {
-            wb.n_tokens = 0;
-            for (int s = 0; s < M; ++s) batch_add(wb, (1 + s) % nv, 0, s, true);
-            if (llama_decode(ctx, wb) != 0) fatal("warmup decode failed");
-            if (ctx_dft && llama_decode(ctx_dft, wb) != 0) fatal("warmup draft decode failed");
+            wb.clear();
+            if (ctx_dft) wb_dft.clear();
+            for (int s = 0; s < M; ++s) {
+                wb.add((1 + s) % nv, 0, s, true);
+                if (ctx_dft) wb_dft.add((1 + s) % nv, 0, s, true);
+            }
+            if (!decode_batch(ctx, wb)) fatal("warmup decode failed");
+            if (ctx_dft && !decode_batch(ctx_dft, wb_dft)) fatal("warmup draft decode failed");
             for (int s = 0; s < M; ++s) {
                 llama_memory_seq_rm(mem, s, -1, -1);
                 if (mem_dft) llama_memory_seq_rm(mem_dft, s, -1, -1);
             }
         }
-        llama_batch_free(wb);
     }
     common_batch bt(ctx);
-    llama_batch dpb = llama_batch_init(n_batch, 0, 1);   // draft prefill on the decode rank
+    common_batch dpb;                                     // draft prefill on the decode rank
+    if (ctx_dft) dpb = common_batch(ctx_dft);
 
     MPI_Barrier(MPI_COMM_WORLD);          // epoch barrier
     g_t0 = MPI_Wtime();
@@ -1657,10 +1670,10 @@ static void run_decode(const Args & a, llama_model * model, llama_model * model_
                 if (q.hdr.kv_dft_bytes == 0) {                // --draft-prefill decode
                     const double td = now_s();
                     for (int i0 = 0; i0 < q.hdr.isl; i0 += n_batch) {
-                        dpb.n_tokens = 0;
+                        dpb.clear();
                         const int i1 = std::min(q.hdr.isl, i0 + n_batch);
-                        for (int i = i0; i < i1; ++i) batch_add(dpb, q.hist[i], i, q.slot, i + 1 == q.hdr.isl);
-                        if (llama_decode(ctx_dft, dpb) != 0) fatal("draft prefill on decode rank failed");
+                        for (int i = i0; i < i1; ++i) dpb.add(q.hist[i], i, q.slot, i + 1 == q.hdr.isl);
+                        if (!decode_batch(ctx_dft, dpb)) fatal("draft prefill on decode rank failed");
                     }
                     st.t_draft_prefill += now_s() - td;
                     st.busy += now_s() - td;
@@ -1766,7 +1779,8 @@ static void run_decode(const Args & a, llama_model * model, llama_model * model_
     dpool.free_all();
     if (spec && g_verbose) common_speculative_print_stats(spec);
     common_speculative_free(spec);
-    llama_batch_free(dpb);
+    bt = common_batch();          // release the batches before their contexts
+    dpb = common_batch();
     if (ctx_dft) llama_free(ctx_dft);
     llama_free(ctx);
 }

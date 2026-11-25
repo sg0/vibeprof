@@ -58,7 +58,9 @@ cmake --build build -j
 
 llama.cpp is added with `add_subdirectory` and built as static libraries: `llama`, `ggml`, and `llama-common`
 for speculative decoding, sampling and Jinja chat templates. GGML options are passed straight through. Requires
-an MPI-3 library (MPICH, Open MPI, Cray MPICH, Intel MPI, MVAPICH…) and a C++17 compiler.
+an MPI-3 library (MPICH, Open MPI, Cray MPICH, Intel MPI, MVAPICH…) and a C++17 compiler. Needs llama.cpp from
+2026-09-24 or later (extended batch API: `common_batch`, `llama_process`); builds without warnings up to `5917b39`
+(2026-11-25).
 
 **Optional: GPU-direct KV transfer.** To keep KV data in GPU memory end to end (`--kv-transport device`, see
 *KV transfer* below), apply the small llama.cpp patch before configuring:
@@ -74,15 +76,39 @@ If you patch by hand, note that `git -C ../llama.cpp apply PATCH` resolves `PATC
 so use an absolute path. CMake reports whether the split-state API was found. Without the patch everything else
 works, and KV transfer uses host memory.
 
-**If configuring fails** with `target_compile_features specified unknown feature ""` on llama.cpp's targets,
-check the `cmake` binary (e.g., a site-built CMake 4.5.1 on ALCF Polaris caused an issue), while the
-official Kitware binaries 3.18 through 4.5.1 configure cleanly. Use an official binary (unpack and run `bin/cmake`; 
-no install needed):
+### ALCF Polaris
+
+Polaris defaults to `PrgEnv-nvhpc`, whose `cc`/`CC` wrappers call `nvc`/`nvc++`; llama.cpp needs GCC or Clang as
+the host compiler (`nvc++` rejects its warning flags, e.g. `Unknown switch: -Wmissing-declarations`). Build with
+the GNU environment for host code and `nvcc` for the CUDA kernels, keeping the Cray wrappers so Cray MPICH and
+its GPU support (GTL) are linked:
+
+```bash
+module load PrgEnv-gnu                     # Cray wrappers cc/CC now call gcc/g++ instead of nvc/nvc++
+module load cuda/13.0
+module load craype-x86-milan craype-accel-nvidia80     # accel module: links Cray MPICH's GPU (GTL) support
+module use /soft/modulefiles
+
+cd ~/projects/vibeprof && rm -rf build
+cmake -S . -B build \
+  -DCMAKE_C_COMPILER=cc -DCMAKE_CXX_COMPILER=CC \
+  -DCMAKE_CUDA_COMPILER=$(which nvcc) -DCMAKE_CUDA_HOST_COMPILER=$(which g++) \
+  -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=80 \
+  -DLLAMA_CPP_DIR=$HOME/sources/llama.cpp
+cmake --build build -j 16
+```
+
+At run time, `export MPICH_GPU_SUPPORT_ENABLED=1` enables GPU-aware MPI (needed for `--kv-transport device`).
+
+**CMake.** The site-built CMake 4.5.1 on Polaris fails to configure llama.cpp with
+`target_compile_features specified unknown feature ""` on every llama.cpp target, although the arguments are
+correct. The official Kitware binaries (3.18 through 4.5.1) configure cleanly; use one (unpack and run
+`bin/cmake`, no install needed) in place of `cmake` above:
 
 ```bash
 cd ~ && curl -LO https://github.com/Kitware/CMake/releases/download/v4.2.0/cmake-4.2.0-linux-x86_64.tar.gz
 tar xzf cmake-4.2.0-linux-x86_64.tar.gz
-cd /path/to/vibeprof && rm -rf build && ~/cmake-4.2.0-linux-x86_64/bin/cmake -S . -B build -DLLAMA_CPP_DIR=/path/to/llama.cpp
+export PATH=$HOME/cmake-4.2.0-linux-x86_64/bin:$PATH
 ```
 
 ## Run
