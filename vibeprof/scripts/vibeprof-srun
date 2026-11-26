@@ -11,7 +11,8 @@
 #
 # Options:
 #   -o, --out DIR        profile directory (default: vibeprof-<jobid>.<step> or vibeprof-<time>-<pid>)
-#   --lib PATH[:PATH]    library/preload list (default: $VIBEPROF_LIB or ../build/libvibeprof.so);
+#   --lib PATH[:PATH]    library/preload list (default: $VIBEPROF_LIB, else libvibeprof.so from the
+#                        top-level build <repo>/build/vibeprof or a standalone vibeprof/build);
 #                        prepend libvibeperturb.so to inject faults for testing
 #   --no-report          only collect; analyze later with tools/vibeprof_report.py DIR
 #   --png                also write PNG figures
@@ -36,7 +37,15 @@ set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/.." && pwd)"
-lib="${VIBEPROF_LIB:-$root/build/libvibeprof.so}"
+# profiler build: the top-level build (<repo>/build/vibeprof) or a standalone one (vibeprof/build)
+vibeprof_build() {
+  local d
+  for d in "$1/../build/vibeprof" "$1/build"; do
+    [[ -f "$d/libvibeprof.so" ]] && { (cd "$d" && pwd); return; }
+  done
+  echo "$(cd "$1/.." && pwd)/build/vibeprof"
+}
+lib="${VIBEPROF_LIB:-$(vibeprof_build "$root")/libvibeprof.so}"
 out=""; report=1; rargs=(); llm_launcher="${VIBEPROF_LLM_LAUNCHER:-}"; extra=""; gpu=""; kokkos=0
 
 usage() { sed -n '2,/^set -e/p' "$0" | sed '$d;s/^# \{0,1\}//'; exit "${1:-0}"; }
@@ -63,7 +72,11 @@ done
 abs=()
 IFS=: read -r -a parts <<< "$lib"
 for p in "${parts[@]}"; do
-  [[ -f "$p" ]] || { echo "vibeprof-srun: library not found: $p (build vibeprof or set VIBEPROF_LIB)" >&2; exit 2; }
+  [[ -f "$p" ]] || { echo "vibeprof-srun: library not found: $p" >&2
+                     echo "  build it (the top-level build includes the profiler; add -DVIBEPROF_BUILD_LLM=OFF" >&2
+                     echo "  to skip the llama.cpp engine):" >&2
+                     echo "    cmake -S $(cd "$root/.." && pwd) -B $(cd "$root/.." && pwd)/build && cmake --build $(cd "$root/.." && pwd)/build -j" >&2
+                     echo "  or set VIBEPROF_LIB to a built libvibeprof.so" >&2; exit 2; }
   abs+=("$(cd "$(dirname "$p")" && pwd)/$(basename "$p")")
 done
 lib="$(IFS=:; echo "${abs[*]}")"

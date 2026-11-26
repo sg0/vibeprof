@@ -12,7 +12,15 @@ set -uo pipefail
 mode="${1:-sim}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 L="$(cd "$here/.." && pwd)"
-B="${VIBEPROF_BUILD:-$L/build}"
+# profiler build: the top-level build (<repo>/build/vibeprof) or a standalone one (vibeprof/build)
+vibeprof_build() {
+  local d
+  for d in "$1/../build/vibeprof" "$1/build"; do
+    [[ -f "$d/libvibeprof.so" ]] && { (cd "$d" && pwd); return; }
+  done
+  echo "$(cd "$1/.." && pwd)/build/vibeprof"
+}
+B="${VIBEPROF_BUILD:-$(vibeprof_build "$L")}"
 out="${2:-gpu-validate-$mode}"
 mkdir -p "$out"; out="$(cd "$out" && pwd)"
 ITERS="${ITERS:-40}"

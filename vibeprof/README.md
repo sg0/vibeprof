@@ -24,8 +24,13 @@ per node that consolidate profiles on the fly are planned, not built.
 ## Build
 
 ```bash
-cd vibeprof && cmake -B build && cmake --build build -j
+cmake -S . -B build -DVIBEPROF_BUILD_LLM=OFF && cmake --build build -j    # from the repository root
+# or on its own:   cd vibeprof && cmake -B build && cmake --build build -j
 ```
+
+The repository's top-level build includes the profiler (in `build/vibeprof/`; `-DVIBEPROF_BUILD_LLM=OFF` skips
+the llama.cpp engine). `vibeprof-srun`, `tests/gpu_validate.sh` and `apps/build.sh` find the libraries in either
+place (or set `VIBEPROF_LIB` / `VIBEPROF_BUILD`). Below, `build/` means that directory.
 
 Produces `libvibeprof.so` (collector, including the GPU backend), `libvibeprof_stub.so` (no-op
 markers), `libvibeperturb.so` (fault injection for testing), `vibeprof_toy` (a test program with

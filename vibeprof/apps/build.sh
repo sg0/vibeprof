@@ -6,11 +6,19 @@
 # Each app is pinned to the commit the patch was made against, gets phase markers from
 # apps/<app>/*.patch, and links libvibeprof_stub (no-op markers), so the binaries run normally
 # and are profiled by preloading libvibeprof.so (scripts/vibeprof-srun). Needs mpicc/mpicxx in
-# PATH and vibeprof built in ../build (or VIBEPROF_BUILD=...).
+# PATH and vibeprof built (top-level build, standalone vibeprof/build, or VIBEPROF_BUILD=...).
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 L="$(cd "$here/.." && pwd)"
-B="${VIBEPROF_BUILD:-$L/build}"
+# profiler build: the top-level build (<repo>/build/vibeprof) or a standalone one (vibeprof/build)
+vibeprof_build() {
+  local d
+  for d in "$1/../build/vibeprof" "$1/build"; do
+    [[ -f "$d/libvibeprof.so" ]] && { (cd "$d" && pwd); return; }
+  done
+  echo "$(cd "$1/.." && pwd)/build/vibeprof"
+}
+B="${VIBEPROF_BUILD:-$(vibeprof_build "$L")}"
 work="${1:-proxy}"; shift || true
 apps=("$@"); [[ ${#apps[@]} -gt 0 ]] || apps=(minife quicksilver amg)
 mkdir -p "$work"; work="$(cd "$work" && pwd)"

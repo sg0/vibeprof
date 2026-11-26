@@ -56,6 +56,11 @@ cmake -S . -B build -DLLAMA_CPP_DIR=../llama.cpp -DGGML_CUDA=ON      # or -DGGML
 cmake --build build -j
 ```
 
+One build makes both parts: `build/vibeprof_llm` (the engine) and the profiler in `build/vibeprof/`
+(`libvibeprof.so` and friends, which `vibeprof-srun` and the tools find there). `-DVIBEPROF_BUILD_LLM=OFF` builds
+only the profiler and needs no llama.cpp; `-DVIBEPROF_BUILD_PROFILER=OFF` only the engine. The profiler also
+builds on its own (`cmake -S vibeprof -B vibeprof/build`); see [vibeprof/README.md](vibeprof/README.md).
+
 llama.cpp is added with `add_subdirectory` and built as static libraries: `llama`, `ggml`, and `llama-common`
 for speculative decoding, sampling and Jinja chat templates. GGML options are passed straight through. Requires
 an MPI-3 library (MPICH, Open MPI, Cray MPICH, Intel MPI, MVAPICH…) and a C++17 compiler. Needs llama.cpp from
@@ -97,6 +102,11 @@ cmake -S . -B build \
   -DLLAMA_CPP_DIR=$HOME/sources/llama.cpp
 cmake --build build -j 16
 ```
+
+This also builds the profiler into `build/vibeprof/`, with the same compilers and MPI as the applications you
+profile. The CUDA options also build its `gpu_toy` test program (`tests/gpu_validate.sh real`); `libvibeprof.so`
+itself needs no CUDA at build time and loads CUPTI at run time. For the profiler alone, add
+`-DVIBEPROF_BUILD_LLM=OFF` (no llama.cpp needed).
 
 At run time, `export MPICH_GPU_SUPPORT_ENABLED=1` enables GPU-aware MPI (needed for `--kv-transport device`).
 Each node has a 3.2 TB local SSD at `/local/scratch` (wiped between jobs); `--model-stage /local/scratch` copies

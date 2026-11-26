@@ -51,8 +51,24 @@ if (CMAKE_CUDA_COMPILER)
             set(CMAKE_CUDA_ARCHITECTURES 70 80 90)
         endif()
     endif()
-    add_executable(gpu_toy tests/gpu_toy_real.cu)
-    target_link_libraries(gpu_toy PRIVATE vibeprof_stub MPI::MPI_CXX)
+    # nvcc compiles the toy, so it needs mpi.h explicitly: with compiler wrappers that add MPI themselves
+    # (Cray cc/CC, mpicxx as CMAKE_CXX_COMPILER) FindMPI reports no include directory.
+    find_path(VIBEPROF_MPI_INCLUDE_DIR mpi.h
+              HINTS ${MPI_CXX_INCLUDE_DIRS} ${MPI_C_INCLUDE_DIRS} ENV MPICH_DIR ENV CRAY_MPICH_DIR ENV MPI_ROOT ENV MPI_HOME
+              PATH_SUFFIXES include)
+    find_package(CUDAToolkit)
+    if (VIBEPROF_MPI_INCLUDE_DIR AND TARGET CUDA::cudart)
+        add_executable(gpu_toy tests/gpu_toy_real.cu)
+        target_include_directories(gpu_toy PRIVATE ${VIBEPROF_MPI_INCLUDE_DIR})
+        target_compile_definitions(gpu_toy PRIVATE MPICH_SKIP_MPICXX OMPI_SKIP_MPICXX)   # C API only
+        # link with the C++ compiler (MPI wrappers add their libraries there) plus the CUDA runtime
+        set_target_properties(gpu_toy PROPERTIES LINKER_LANGUAGE CXX CUDA_RUNTIME_LIBRARY Shared)
+        target_link_libraries(gpu_toy PRIVATE vibeprof_stub MPI::MPI_CXX CUDA::cudart)
+        message(STATUS "vibeprof: building gpu_toy (mpi.h from ${VIBEPROF_MPI_INCLUDE_DIR})")
+    else()
+        message(STATUS "vibeprof: not building gpu_toy: mpi.h or the CUDA runtime not found "
+                       "(set VIBEPROF_MPI_INCLUDE_DIR to the directory with mpi.h)")
+    endif()
 endif()
 
 install(TARGETS vibeprof vibeprof_stub vibeperturb LIBRARY DESTINATION lib)
