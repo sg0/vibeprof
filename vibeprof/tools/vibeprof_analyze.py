@@ -1133,18 +1133,41 @@ FACTS
 FINAL_INSTRUCTIONS = INSTRUCTIONS.replace("FACTS\n", "PHASE NOTES (written earlier from the same data; ids refer to the facts)\n{notes}\n\nFACTS\n")
 
 
-def build_prompts(A, M, F, map_reduce=False, max_tokens=900, brief=False):
+QUESTIONS_BLOCK = """QUESTIONS FROM THE USER (answer these first)
+Start with a section "## Answers": one short paragraph per question, numbered as below, before everything else.
+The same rules apply: use only the facts, follow every number with its id, refer to findings by id. If the facts
+cannot answer a question, say so plainly and name the measurement that would (do not guess).
+{questions}
+
+"""
+
+
+def with_questions(instructions, questions):
+    """Insert the user's questions before the FACTS section of a prompt template."""
+    if not questions:
+        return instructions
+    qs = "\n".join("%d. %s" % (i, " ".join(q.split())) for i, q in enumerate(questions, 1))
+    return instructions.replace("FACTS\n", QUESTIONS_BLOCK.format(questions=qs) + "FACTS\n", 1)
+
+
+def build_prompts(A, M, F, map_reduce=False, max_tokens=900, brief=False, questions=None):
+    """LLM prompts. questions: optional list of user questions/focus areas, answered first in the report or brief."""
+    questions = [q for q in (questions or []) if q.strip()]
     sheet = facts_sheet(A, M, F)
     msgs = lambda u: {"messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": u}]}
+    extra = 150 * len(questions)   # room for the answers
     if brief:
-        r = msgs(BRIEF_INSTRUCTIONS + sheet)
+        instr = BRIEF_INSTRUCTIONS
+        if questions:
+            instr = instr.replace("(at most 200 words)", "(at most %d words)" % (200 + 80 * len(questions)))
+        r = msgs(with_questions(instr, questions) + sheet)
         r["id"] = "brief"
-        r["max_tokens"] = min(max_tokens, 400)
+        r["max_tokens"] = min(max_tokens, 400) + extra
         return sheet, [r]
     if not map_reduce:
-        r = msgs(INSTRUCTIONS + sheet)
+        r = msgs(with_questions(INSTRUCTIONS, questions) + sheet)
         r["id"] = "report"
-        r["max_tokens"] = max_tokens
+        r["max_tokens"] = max_tokens + extra
         return sheet, [r]
     out = []
     for p in A["phases"]:

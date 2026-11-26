@@ -20,6 +20,8 @@
 #   --model GGUF         let an LLM write the interpretation (runs vibeprof_llm); a path, or
 #                        hf:<owner>/<repo>/<file.gguf>, downloaded once into $VIBEPROF_MODEL_DIR
 #   --model-stage DIR    copy the model to node-local DIR (e.g. /local/scratch) before the LLM step
+#   --ask TEXT           question or focus for the LLM, answered first in its report (repeatable; needs --model)
+#   --ask-file FILE      questions from a file: one per line, or JSON lines with "question"/"prompt"
 #   --llm-launcher CMD   launcher for the LLM step (default: "srun -n 2 --overlap" inside an
 #                        allocation, else "mpirun -np 2")
 #   --report-args STR    extra arguments for vibeprof_report.py, e.g. "--map-reduce --ctx 16384"
@@ -58,6 +60,8 @@ while [[ $# -gt 0 ]]; do
     --png|--brief|--map-reduce) rargs+=("$1"); shift ;;
     --model)         rargs+=(--model "$2"); shift 2 ;;
     --model-stage)   rargs+=(--model-stage "$2"); shift 2 ;;
+    --ask)           rargs+=(--ask "$2"); shift 2 ;;
+    --ask-file)      rargs+=(--ask-file "$2"); shift 2 ;;
     --llm-launcher)  llm_launcher="$2"; shift 2 ;;
     --report-args)   extra="$2"; shift 2 ;;
     --gpu)           gpu="$2"; shift 2 ;;

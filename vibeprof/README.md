@@ -169,6 +169,26 @@ validated: every `[M#]`/`[F#]` must exist and every number must occur in the dat
 shown under the text, and text without citations is flagged as ungrounded. Use an instruction-
 tuned model of 7B parameters or more; small models do not follow the citation rules.
 
+**Asking your own questions.** `--ask TEXT` (repeatable) puts free-form performance questions in front of the
+model; it answers them first, in an `## Answers` section, then writes the usual report:
+
+```bash
+scripts/vibeprof-srun --brief --model /path/to/Qwen2.5-7B-Instruct-Q4_K_M.gguf \
+  --ask "Is this application communication or compute bound?" \
+  --ask "Report the severity of load imbalance and possible mitigation strategies" \
+  -- srun -n 128 ./app
+```
+
+`--ask-file FILE` reads questions from a file: plain text (one per line, `#` comments and blank lines
+skipped), a JSON list of strings, or JSON lines with a `question`/`prompt`/`text` field or chat `messages`
+(the last user message is used). The answers follow the same rules as the rest of the text (facts only,
+numbers cited by id, checked by the validator); a question the measurements cannot answer gets a plain
+"cannot tell" plus the measurement that would answer it. Each question adds room to the output budget (and
+to the `--brief` word limit). The questions are listed above the text in `report.md`/`report.html`. With
+`--map-reduce` they go to the final combined prompt only. On an existing profile:
+`tools/vibeprof_report.py DIR --model ... --ask "..."`. (`vibeprof_llm -p` is a different thing: the
+engine's prompts file.)
+
 **Getting a model.** Download a single-file GGUF once, e.g. Qwen2.5-7B-Instruct Q4_K_M (4.7 GB). On clusters,
 do this on a login node (compute nodes often have no internet) into project storage rather than `$HOME`:
 

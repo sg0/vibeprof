@@ -119,6 +119,30 @@ def validate(text, A, M, F, sheet):
 
 
 # ------------------------------------------------------------------------------------------------
+def read_questions(path):
+    """Questions from a file: plain text (one per line, '#' comments), or JSON lines / a JSON list whose items are
+    strings or objects with "question", "prompt" or "text", or chat "messages" (the last user message is used)."""
+    with open(path) as f:
+        raw = f.read()
+    def item(x):
+        if isinstance(x, str):
+            return x
+        if isinstance(x, dict):
+            for k in ("question", "prompt", "text"):
+                if isinstance(x.get(k), str):
+                    return x[k]
+            users = [m.get("content") for m in x.get("messages", []) if isinstance(m, dict) and m.get("role") == "user"]
+            if users and isinstance(users[-1], str):
+                return users[-1]
+        raise ValueError("%s: cannot read a question from %r" % (path, str(x)[:80]))
+    body = raw.strip()
+    if body.startswith("["):
+        return [item(x) for x in json.loads(body)]
+    if body.startswith("{"):
+        return [item(json.loads(line)) for line in body.splitlines() if line.strip()]
+    return [l.strip() for l in body.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("profile_dir")
@@ -129,6 +153,11 @@ def main():
                                     "(downloaded once into $VIBEPROF_MODEL_DIR, default ~/.cache/vibeprof/models); "
                                     "omit for the rule-based report only")
     ap.add_argument("--map-reduce", action="store_true", help="LLM: one note per top-level phase, then a combined report")
+    ap.add_argument("--ask", action="append", default=[], metavar="TEXT",
+                    help="question or focus for the LLM, answered first (repeatable), e.g. "
+                         "--ask \"How severe is the load imbalance and how can it be mitigated?\"")
+    ap.add_argument("--ask-file", metavar="FILE", help="questions from a file: one per line, or JSON lines with "
+                                                      "\"question\"/\"prompt\" (or chat \"messages\")")
     ap.add_argument("--max-tokens", type=int, default=900)
     ap.add_argument("--llm-bin", default=DEFAULT_LLM_BIN, help="path to vibeprof_llm (default: %(default)s)")
     ap.add_argument("--launcher", default=os.environ.get("VIBEPROF_LLM_LAUNCHER", "mpirun -np 2"),
@@ -140,6 +169,16 @@ def main():
                          "(env VIBEPROF_MODEL_STAGE)")
     ap.add_argument("--llm-args", default="", help="extra vibeprof_llm arguments, e.g. \"-ngl 99\"")
     a = ap.parse_args()
+    questions = list(a.ask)
+    if a.ask_file:
+        try:
+            questions += read_questions(a.ask_file)
+        except (OSError, ValueError) as e:
+            ap.error("--ask-file: %s" % e)
+    questions = [q.strip() for q in questions if q.strip()]
+    if questions and not a.model:
+        print("vibeprof: --ask needs --model (an LLM answers the questions); writing the rule-based report only",
+              file=sys.stderr)
 
     out = a.out or os.path.join(a.profile_dir, "analysis")
     os.makedirs(out, exist_ok=True)
@@ -169,16 +208,20 @@ def main():
                 _, phase_prompts = LA.build_prompts(A, M, F, map_reduce=True, max_tokens=a.max_tokens)
                 notes = run_llm(phase_prompts, a, out, "phases") if phase_prompts else {}
                 note_txt = "\n".join("[%s]\n%s\n" % (k.split(":", 1)[1], v) for k, v in notes.items()) or "(none)"
-                final = {"id": "report", "max_tokens": a.max_tokens,
+                final = {"id": "report", "max_tokens": a.max_tokens + 150 * len(questions),
                          "messages": [{"role": "system", "content": LA.SYSTEM},
-                                      {"role": "user", "content": LA.FINAL_INSTRUCTIONS.replace("{notes}", note_txt) + sheet}]}
+                                      {"role": "user", "content": LA.with_questions(LA.FINAL_INSTRUCTIONS.replace("{notes}", note_txt),
+                                                                                    questions) + sheet}]}
                 text = run_llm([final], a, out, "final")["report"]
                 w("phase_notes.md", note_txt)
             else:
-                _, prompts = LA.build_prompts(A, M, F, max_tokens=a.max_tokens, brief=a.brief)
+                _, prompts = LA.build_prompts(A, M, F, max_tokens=a.max_tokens, brief=a.brief, questions=questions)
                 text = run_llm(prompts, a, out, "brief" if a.brief else "report")[prompts[0]["id"]]
-            check = validate(text, A, M, F, sheet)
-            llm = {"text": text, "check": check, "model": os.path.basename(a.model)}
+            # numbers quoted from the user's own questions are not invented by the model
+            check = validate(text, A, M, F, sheet + "\n" + "\n".join(questions))
+            asked = ("**Questions asked:**\n\n" + "\n".join("%d. %s" % (i, q) for i, q in enumerate(questions, 1)) + "\n\n"
+                     if questions else "")
+            llm = {"text": asked + text, "check": check, "model": os.path.basename(a.model)}
             print("vibeprof: LLM text: %d citations, %d unknown ids, %d unsupported numbers"
                   % (check["citations"], len(check["unknown_ids"]), len(check["unsupported"])))
         except RuntimeError as e:
@@ -192,6 +235,9 @@ def main():
                "**Validation:** %s%d citations; unknown ids: %s; numbers not found in the data: %s." % (
                    "" if c["citations"] else "NO CITATIONS - the text is not grounded in the data; ", c["citations"], ", ".join(c["unknown_ids"]) or "none", ", ".join(c["unsupported"]) or "none"),
                "Treat flagged statements with care; the rule-based findings below are computed directly from the profile.", ""]
+    if questions and not llm:
+        md += ["**Questions** (not answered: no LLM ran; pass --model):", ""] + \
+              ["%d. %s" % (i, q) for i, q in enumerate(questions, 1)] + [""]
     md.append(brief if not llm else "")
     md.append(LA.deterministic_report(A, M, F))
     w("report.md", "\n".join(md))
