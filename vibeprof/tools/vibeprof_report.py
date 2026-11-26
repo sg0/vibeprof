@@ -44,7 +44,7 @@ def run_llm(prompts, a, work, tag):
             f.write(json.dumps({"messages": p["messages"], "max_tokens": p["max_tokens"]}) + "\n")
     cmd = shlex.split(a.launcher) + [a.llm_bin, "-m", a.model, "-p", pin, "-n", str(len(prompts)),
                                      "--chat", a.chat, "--temp", "0", "--osl-from-data", "--ignore-eos", "off",
-                                     "-c", str(a.ctx), "--output", pout] + shlex.split(a.llm_args)
+                                     "-c", str(a.ctx), "--output", pout] + (["--model-stage", a.model_stage] if a.model_stage else []) + shlex.split(a.llm_args)
     print("vibeprof: running", " ".join(shlex.quote(c) for c in cmd), flush=True)
     log = os.path.join(work, "llm-%s.log" % tag)
     with open(log, "w") as lf:
@@ -135,6 +135,9 @@ def main():
                     help='MPI launcher for the LLM step, e.g. "srun -n 4 --overlap" (env VIBEPROF_LLM_LAUNCHER)')
     ap.add_argument("--ctx", type=int, default=8192, help="LLM context size")
     ap.add_argument("--chat", default="on", choices=["on", "off", "auto"], help="apply the model's chat template")
+    ap.add_argument("--model-stage", metavar="DIR", default=os.environ.get("VIBEPROF_MODEL_STAGE", ""),
+                    help="copy the model to node-local DIR (e.g. /local/scratch) once per node before loading "
+                         "(env VIBEPROF_MODEL_STAGE)")
     ap.add_argument("--llm-args", default="", help="extra vibeprof_llm arguments, e.g. \"-ngl 99\"")
     a = ap.parse_args()
 

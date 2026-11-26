@@ -99,6 +99,13 @@ cmake --build build -j 16
 ```
 
 At run time, `export MPICH_GPU_SUPPORT_ENABLED=1` enables GPU-aware MPI (needed for `--kv-transport device`).
+Each node has a 3.2 TB local SSD at `/local/scratch` (wiped between jobs); `--model-stage /local/scratch` copies
+the model there once per node at startup instead of having every node read it from Eagle.
+
+**Model memory.** llama.cpp memory-maps the GGUF, so the ranks of a node share one copy of the weights in the
+page cache rather than each holding its own; GPU ranks also copy their weights to GPU memory. Those cached pages
+are reclaimable: when an application needs the memory the kernel drops them and reads them back on use, which
+`--model-stage` makes a local NVMe read instead of a parallel file system read.
 
 **CMake.** The site-built CMake 4.5.1 on Polaris fails to configure llama.cpp with
 `target_compile_features specified unknown feature ""` on every llama.cpp target, although the arguments are
@@ -145,6 +152,7 @@ srun -N2 --ntasks-per-node=8 --cpu-bind=cores ./build/vibeprof_llm -m model.gguf
 | option | meaning |
 |---|---|
 | `-m` | target GGUF model |
+| `--model-stage DIR` | copy the model (and draft model) to node-local `DIR` once per node and load from there, e.g. `/local/scratch`; default `$VIBEPROF_MODEL_STAGE`. Split GGUFs copy every part; an identical copy (same size and mtime) is reused |
 | `-n`, `--duration` | total requests (default 64, or the number of records with `-p`), or wall time to keep claiming (`-n 0`) |
 | `--isl`, `--isl-std` | synthetic input length mean / stddev (normal, clipped to `[1, ctx-osl]`) |
 | `--osl`, `--osl-std` | output length = max new tokens |

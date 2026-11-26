@@ -196,6 +196,11 @@ tools/vibeprof_model.py hf:bartowski/Qwen2.5-7B-Instruct-GGUF/Qwen2.5-7B-Instruc
 or set the site proxy in the job (ALCF Polaris: `export https_proxy=http://proxy.alcf.anl.gov:3128`).
 `tools/vibeprof_model.py` also works for the engine directly: `vibeprof_llm -m "$(tools/vibeprof_model.py hf:...)"`.
 
+**Node-local copy.** `--model-stage DIR` (or `VIBEPROF_MODEL_STAGE`) copies the model to node-local storage once
+per node before the LLM step loads it, e.g. `--model-stage /local/scratch` on Polaris. The model is memory-mapped
+either way, so ranks on a node share one copy of the weights in the page cache; staging keeps the reads off the
+shared file system and makes pages the kernel evicts under memory pressure cheap to read back.
+
 ## Validation
 
 Ground truth comes from `libvibeperturb.so`, preloaded before the collector

@@ -49,13 +49,17 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <numeric>
 #include <random>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
 
@@ -116,6 +120,7 @@ static std::vector<std::string> split_csv(const std::string & s) {
 
 struct Args {
     std::string model;
+    std::string model_stage;   // node-local directory to copy the model(s) into before loading ("" = load in place)
     // workload
     int64_t n_requests   = 64;     // total requests (0 => run until --duration)
     bool    n_set        = false;  // -n given explicitly
@@ -201,6 +206,8 @@ static void usage(const char * prog) {
         "usage: mpirun -np N %s -m model.gguf [options]\n\n"
         "workload:\n"
         "  -m,  --model PATH          GGUF model (required)\n"
+        "       --model-stage DIR     copy the model (and draft model) to node-local DIR first, once per node, and\n"
+        "                             load from there (e.g. /local/scratch); default $VIBEPROF_MODEL_STAGE\n"
         "  -n,  --num-requests N      total requests (default 64, or #records with --prompts; 0 = until --duration)\n"
         "       --duration SEC        stop claiming new requests after SEC seconds\n"
         "       --isl N / --isl-std X synthetic input length mean / stddev (default 128 / 0)\n"
@@ -287,6 +294,7 @@ static Args parse_args(int argc, char ** argv) {
     for (int i = 1; i < argc; ++i) {
         std::string k = argv[i];
         if      (k == "-m"  || k == "--model")          a.model = need(i);
+        else if (k == "--model-stage")                  a.model_stage = need(i);
         else if (k == "-n"  || k == "--num-requests") { a.n_requests = atoll(need(i)); a.n_set = true; }
         else if (k == "--duration")                     a.duration = atof(need(i));
         else if (k == "--isl")                          a.isl = atoi(need(i));
@@ -355,6 +363,7 @@ static Args parse_args(int argc, char ** argv) {
         else { usage(argv[0]); fatal("unknown argument: %s", k.c_str()); }
     }
     if (a.model.empty()) { usage(argv[0]); fatal("--model is required"); }
+    if (a.model_stage.empty()) { const char * e = getenv("VIBEPROF_MODEL_STAGE"); if (e) a.model_stage = e; }
     const bool real = !a.prompts.empty();
     if (!real && a.n_requests <= 0 && a.duration <= 0) fatal("need --num-requests > 0 or --duration > 0");
     if (a.osl < 1)   fatal("--osl must be >= 1");
@@ -998,6 +1007,96 @@ static std::vector<ggml_backend_dev_t> gpu_devices() {
 // Testing hook: VIBEPROF_LLM_EMULATE_GPUS=1 keeps GPU role/device assignment (layout, capacities,
 // routing, report) but runs those ranks on the CPU, so GPU topologies can be exercised anywhere.
 static bool emulate_gpus() { const char * e = getenv("VIBEPROF_LLM_EMULATE_GPUS"); return e && atoi(e) != 0; }
+
+// ----------------------------------------------------------------------------
+// Model staging: copy GGUF files to node-local storage (e.g. NVMe) once per node, then load from there.
+// The model is memory-mapped either way (one shared copy in the page cache per node, not one per rank);
+// staging moves the reads off the shared file system and makes evicted pages cheap to read back.
+// ----------------------------------------------------------------------------
+
+// all files of a model: the file itself, or every part of a split GGUF (...-00001-of-00003.gguf)
+static std::vector<std::string> model_files(const std::string & path) {
+    static const std::regex split("^(.*)-([0-9]{5})-of-([0-9]{5})\\.gguf$");
+    std::smatch m;
+    if (!std::regex_match(path, m, split)) return {path};
+    std::vector<std::string> out;
+    const int n = std::stoi(m[3].str());
+    for (int i = 1; i <= n; ++i) {
+        char part[32];
+        snprintf(part, sizeof(part), "-%05d-of-%s.gguf", i, m[3].str().c_str());
+        out.push_back(m[1].str() + part);
+    }
+    return out;
+}
+
+// copy src to dst unless an identical copy (same size and mtime) is already there; returns "" or an error
+static std::string stage_file(const std::string & src, const std::string & dst, double * bytes_copied) {
+    struct stat ss, ds;
+    if (stat(src.c_str(), &ss) != 0) return "cannot stat " + src + ": " + strerror(errno);
+    if (stat(dst.c_str(), &ds) == 0 && ds.st_size == ss.st_size && ds.st_mtime == ss.st_mtime) return "";
+    std::error_code ec;
+    const auto sp = std::filesystem::space(std::filesystem::path(dst).parent_path(), ec);
+    if (!ec && sp.available < (uintmax_t) ss.st_size)
+        return "not enough space in " + std::filesystem::path(dst).parent_path().string() + " for " + src;
+    const std::string tmp = dst + ".tmp." + std::to_string(getpid());
+    const int in = open(src.c_str(), O_RDONLY);
+    if (in < 0) return "cannot open " + src + ": " + strerror(errno);
+    const int out = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (out < 0) { close(in); return "cannot create " + tmp + ": " + strerror(errno); }
+    std::vector<char> buf(64u << 20);
+    std::string err;
+    for (;;) {
+        const ssize_t r = read(in, buf.data(), buf.size());
+        if (r < 0) { err = "read error on " + src + ": " + strerror(errno); break; }
+        if (r == 0) break;
+        for (ssize_t off = 0; off < r;) {
+            const ssize_t w = write(out, buf.data() + off, (size_t) (r - off));
+            if (w < 0) { err = "write error on " + tmp + ": " + strerror(errno); break; }
+            off += w;
+        }
+        if (!err.empty()) break;
+        *bytes_copied += (double) r;
+    }
+    close(in);
+    if (close(out) != 0 && err.empty()) err = "write error on " + tmp + ": " + strerror(errno);
+    if (err.empty()) {
+        struct timespec times[2] = {ss.st_atim, ss.st_mtim};   // keep the source mtime: marks the copy as current
+        utimensat(AT_FDCWD, tmp.c_str(), times, 0);
+        if (rename(tmp.c_str(), dst.c_str()) != 0) err = "cannot rename " + tmp + ": " + strerror(errno);
+    }
+    if (!err.empty()) unlink(tmp.c_str());
+    return err;
+}
+
+// Node leaders copy the model's files into dir; returns the staged path of the (first) model file on every rank.
+static std::string stage_model(const std::string & path, const std::string & dir, MPI_Comm node, int lrank) {
+    const auto files = model_files(path);
+    const std::string base = (std::filesystem::path(dir) / std::filesystem::path(path).filename()).string();
+    if (std::filesystem::path(path).parent_path() == std::filesystem::path(dir)) return path;   // already local
+    std::string err;
+    double bytes = 0, t0 = now_s();
+    if (lrank == 0) {
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        if (ec) err = "cannot create " + dir + ": " + ec.message();
+        for (size_t i = 0; err.empty() && i < files.size(); ++i)
+            err = stage_file(files[i], (std::filesystem::path(dir) / std::filesystem::path(files[i]).filename()).string(), &bytes);
+    }
+    int ok = err.empty() ? 1 : 0;
+    MPI_Bcast(&ok, 1, MPI_INT, 0, node);
+    if (!ok) {
+        if (lrank == 0) fatal("--model-stage: %s", err.c_str());
+        MPI_Barrier(node);   // the leader aborts the job
+        fatal("--model-stage failed on this node's leader");
+    }
+    if (g_rank == 0) {
+        char what[64];
+        if (bytes > 0) snprintf(what, sizeof(what), "%.1f MB copied", bytes / 1e6);
+        else snprintf(what, sizeof(what), "already present");
+        printf("model staged: %s -> %s (%s, %.1f s on node 0)\n", path.c_str(), dir.c_str(), what, now_s() - t0);
+    }
+    return base;
+}
 
 // Loads a model on one GPU (dev >= 0) or CPU only (dev < 0).
 static llama_model * load_model(const std::string & path, int dev, int ngl) {
@@ -2064,6 +2163,12 @@ int main(int argc, char ** argv) {
     MPI_Comm_size(node, &lsize);
     int node_id = g_rank;               // global rank of the node leader identifies the node
     MPI_Bcast(&node_id, 1, MPI_INT, 0, node);
+
+    // ---- optional: copy the model(s) to node-local storage once per node, then load from there ----
+    if (!a.model_stage.empty()) {
+        a.model = stage_model(a.model, a.model_stage, node, lrank);
+        if (!a.draft_model.empty()) a.draft_model = stage_model(a.draft_model, a.model_stage, node, lrank);
+    }
 
     // ---- GPU detection on the node leader only (CPU decode ranks may hide GPUs before backend init) ----
     bool backend_up = false;
