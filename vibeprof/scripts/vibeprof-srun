@@ -132,6 +132,32 @@ case "$style" in
   *)       echo "vibeprof-srun: VIBEPROF_LAUNCHER_STYLE must be srun, openmpi, pals, hydra or env" >&2; exit 2 ;;
 esac
 
+# pre-flight on this node (the ranks inherit this environment): the application binary is the first
+# ELF executable among the launcher arguments
+app=""
+for a in "$@"; do
+  if [[ -f "$a" && -x "$a" ]] && [[ "$(head -c 4 "$a" 2>/dev/null | od -An -c | tr -d ' ')" == "177ELF" ]]; then app="$a"; break; fi
+done
+if [[ -n "$app" ]] && command -v ldd > /dev/null; then
+  appldd="$(ldd "$app" 2>&1 || true)"
+  if grep -q "not a dynamic executable\|statically linked" <<< "$appldd"; then
+    echo "vibeprof-srun: warning: $app is statically linked; LD_PRELOAD cannot intercept its MPI calls" >&2
+  else
+    miss="$(awk '/not found/ {print $1}' <<< "$appldd" | sort -u | tr '\n' ' ')"
+    [[ -n "$miss" ]] && { echo "vibeprof-srun: warning: $app needs libraries the loader cannot find here: $miss" >&2
+                          echo "  load the modules it was built with (e.g. module load cuda/<ver>) or set LD_LIBRARY_PATH" >&2
+                          echo "  before vibeprof-srun; the ranks inherit this environment" >&2; }
+    appmpi="$(awk '/libmpi[._]/ {print $3}' <<< "$appldd" | head -1)"
+    libmpi="$(ldd "${abs[${#abs[@]}-1]}" 2>/dev/null | awk '/libmpi[._]/ {print $3}' | head -1)"
+    [[ -n "$appmpi" && -n "$libmpi" && "$(readlink -f "$appmpi")" != "$(readlink -f "$libmpi")" ]] &&
+      echo "vibeprof-srun: note: $app uses $appmpi, libvibeprof.so uses $libmpi (fine if they share the MPICH ABI)" >&2
+  fi
+fi
+for p in "${abs[@]}"; do
+  miss="$(ldd "$p" 2>/dev/null | awk '/not found/ {print $1}' | sort -u | tr '\n' ' ')"
+  [[ -n "$miss" ]] && echo "vibeprof-srun: warning: $(basename "$p") needs libraries the loader cannot find here: $miss" >&2
+done
+
 echo "vibeprof-srun: profile -> $out ($style launcher)" >&2
 set +e
 "${cmd[@]}"
@@ -155,7 +181,8 @@ if [[ $report -eq 1 ]]; then
       echo "   - the application is statically linked (ldd APP says 'not a dynamic executable'), or uses a" >&2
       echo "     different MPI than libvibeprof.so: compare 'ldd APP | grep -i mpi' with" >&2
       echo "     'ldd ${abs[${#abs[@]}-1]} | grep -i mpi'" >&2
-      echo "   - the application failed before MPI_Init (status $rc)" >&2
+      echo "   - the application failed before MPI_Init (status $rc); a rank exit code of 127 means the" >&2
+      echo "     program or one of its shared libraries was not found (see the loader message above)" >&2
     fi
     exit $(( rc ? rc : 3 ))
   fi
