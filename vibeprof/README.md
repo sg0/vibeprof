@@ -39,14 +39,19 @@ symbolized with `addr2line`, so build the application with `-g` for file:line si
 ```bash
 # Slurm
 scripts/vibeprof-srun -- srun -N 4 -n 128 ./app args
-# any launcher (MPICH/Hydra -genv or Open MPI -x is chosen automatically)
+# any launcher (Cray PALS --env, MPICH/Hydra -genv or Open MPI -x is chosen automatically)
 scripts/vibeprof-srun --png -- mpirun -np 8 ./app args
+# PBS + Cray PALS (ALCF Polaris)
+scripts/vibeprof-srun -- mpiexec -n 64 --ppn 4 --depth 8 --cpu-bind depth ./app args
 # short interpretation written by an LLM (runs vibeprof_llm as a separate job step)
 scripts/vibeprof-srun --brief --model /models/qwen2.5-7b-instruct-q4_k_m.gguf -- srun -n 128 ./app
 ```
 
 The wrapper sets `LD_PRELOAD` through the launcher, so only the ranks are profiled, writes the
-profile to `vibeprof-<jobid>…/` (or `-o DIR`), then builds the report into `DIR/analysis/`.
+profile to `vibeprof-<jobid>…/` (Slurm or PBS job id; or `-o DIR`), then builds the report into
+`DIR/analysis/`. Rank 0 writes `DIR/started` at `MPI_Init`; every rank writes its profile at
+`MPI_Finalize`, so a run that fails, calls `MPI_Abort` or exits without `MPI_Finalize` leaves no
+profile. When no profile appears, the wrapper says which of the two cases happened and what to check.
 Manual use: `LD_PRELOAD=build/libvibeprof.so VIBEPROF_DIR=prof srun ./app`, then
 `tools/vibeprof_report.py prof`.
 
@@ -56,7 +61,8 @@ Manual use: `LD_PRELOAD=build/libvibeprof.so VIBEPROF_DIR=prof srun ./app`, then
 | `VIBEPROF_DIR` | profile directory |
 | `VIBEPROF_MAX_INSTANCES` | phase instances kept per phase for trend charts (default 5000) |
 | `VIBEPROF_FAKE_PPN=k` | testing only: pretend ranks run k per node |
-| `VIBEPROF_LLM_LAUNCHER` | launcher for the LLM step (default `srun -n 2 --overlap` in an allocation, else `mpirun -np 2`) |
+| `VIBEPROF_LLM_LAUNCHER` | launcher for the LLM step (default `srun -n 2 --overlap` in a Slurm job, `mpiexec -n 2 --ppn 2` with Cray PALS, else `mpirun -np 2`) |
+| `VIBEPROF_LAUNCHER_STYLE` | override the launcher detection: `srun`, `openmpi`, `pals`, `hydra` or `env` |
 | `VIBEPROF_GPU=auto\|cuda\|none` | GPU measurement (default `auto`: on when an NVIDIA driver with GPUs is found) |
 | `VIBEPROF_CUPTI_LIB`, `VIBEPROF_CUDA_LIB` | locations of `libcupti.so` / `libcuda.so.1` if the search below fails |
 | `VIBEPROF_GPU_API=0` | do not trace CUDA API calls (lower overhead; no phase attribution of GPU work) |

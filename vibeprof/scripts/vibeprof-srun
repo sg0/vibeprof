@@ -3,10 +3,11 @@
 #
 #   vibeprof-srun [options] -- srun   -N 4 -n 128 ./app args...
 #   vibeprof-srun [options] -- mpirun -np 8 ./app args...
+#   vibeprof-srun [options] -- mpiexec -n 64 --ppn 4 ./app args...     (HPE Cray PALS, e.g. ALCF Polaris)
 #
 # The collector is injected with LD_PRELOAD through the launcher's own environment option
-# (srun --export, Open MPI -x, MPICH/Hydra -genv), so the launcher process itself is not
-# profiled. After the job step ends, vibeprof_report.py writes PROFILE/analysis/{report.html,
+# (srun --export, Open MPI -x, Cray PALS --env, MPICH/Hydra -genv), so the launcher process itself
+# is not profiled. After the job step ends, vibeprof_report.py writes PROFILE/analysis/{report.html,
 # report.md, brief.md, ...}.
 #
 # Options:
@@ -22,8 +23,8 @@
 #   --model-stage DIR    copy the model to node-local DIR (e.g. /local/scratch) before the LLM step
 #   --ask TEXT           question or focus for the LLM, answered first in its report (repeatable; needs --model)
 #   --ask-file FILE      questions from a file: one per line, or JSON lines with "question"/"prompt"
-#   --llm-launcher CMD   launcher for the LLM step (default: "srun -n 2 --overlap" inside an
-#                        allocation, else "mpirun -np 2")
+#   --llm-launcher CMD   launcher for the LLM step (default: "srun -n 2 --overlap" in a Slurm job,
+#                        "mpiexec -n 2 --ppn 2" with Cray PALS, else "mpirun -np 2")
 #   --report-args STR    extra arguments for vibeprof_report.py, e.g. "--map-reduce --ctx 16384"
 #   --gpu MODE           GPU measurement: auto (default: on when NVIDIA GPUs and CUPTI are found),
 #                        cuda (warn if unavailable) or none
@@ -33,7 +34,8 @@
 #
 # Environment passed through to the ranks: VIBEPROF=0 (disable), VIBEPROF_MAX_INSTANCES,
 # VIBEPROF_CUPTI_LIB / VIBEPROF_CUDA_LIB (library locations), VIBEPROF_GPU_API=0,
-# VIBEPROF_FAKE_PPN (testing only). Phase markers need libvibeprof.h calls in the application;
+# VIBEPROF_FAKE_PPN (testing only). VIBEPROF_LAUNCHER_STYLE=srun|openmpi|pals|hydra|env overrides
+# the launcher detection. Phase markers need libvibeprof.h calls in the application;
 # without them the report still covers MPI calls, call sites, ranks, nodes, traffic and GPU use.
 set -euo pipefail
 
@@ -86,9 +88,12 @@ done
 lib="$(IFS=:; echo "${abs[*]}")"
 
 if [[ -z "$out" ]]; then
-  if [[ -n "${SLURM_JOB_ID:-}" ]]; then out="vibeprof-${SLURM_JOB_ID}.$(date +%H%M%S)"; else out="vibeprof-$(date +%Y%m%d-%H%M%S)-$$"; fi
+  if [[ -n "${SLURM_JOB_ID:-}" ]]; then out="vibeprof-${SLURM_JOB_ID}.$(date +%H%M%S)"
+  elif [[ -n "${PBS_JOBID:-}" ]]; then out="vibeprof-${PBS_JOBID%%.*}.$(date +%H%M%S)"
+  else out="vibeprof-$(date +%Y%m%d-%H%M%S)-$$"; fi
 fi
 mkdir -p "$out"; out="$(cd "$out" && pwd)"
+rm -f "$out/started"
 
 # variables for the ranks: the preload, the profile directory, and the vibeprof settings in effect
 vars=("LD_PRELOAD=$lib" "VIBEPROF_DIR=$out")
@@ -100,24 +105,34 @@ done
 
 launcher="$1"; shift
 name="$(basename "$launcher")"
-case "$name" in
-  srun)
-    exp="ALL"; for kv in "${vars[@]}"; do exp+=",$kv"; done
-    cmd=("$launcher" "--export=$exp" "$@") ;;
-  mpirun|mpiexec|mpiexec.hydra|orterun|prterun)
-    cmd=("$launcher")
-    if "$launcher" --version 2>&1 | grep -qiE "open mpi|openrte|prrte"; then
-      for kv in "${vars[@]}"; do cmd+=(-x "$kv"); done
-    else
-      for kv in "${vars[@]}"; do cmd+=(-genv "${kv%%=*}" "${kv#*=}"); done
-    fi
-    cmd+=("$@") ;;
-  *)
-    echo "vibeprof-srun: unknown launcher '$name'; setting LD_PRELOAD for the launcher itself" >&2
-    cmd=(env "${vars[@]}" "$launcher" "$@") ;;
+# how this launcher takes environment variables for the ranks
+launcher_style() {
+  local path ver
+  case "$name" in
+    srun) echo srun; return ;;
+    mpirun|mpiexec|mpiexec.hydra|orterun|prterun) ;;
+    *) echo env; return ;;
+  esac
+  path="$(readlink -f "$(command -v "$launcher" 2>/dev/null || echo "$launcher")" 2>/dev/null || true)"
+  [[ "$path" == */pals/* ]] && { echo pals; return; }          # HPE Cray PALS: /opt/cray/pals/<ver>/bin/mpiexec
+  ver="$("$launcher" --version 2>&1 | head -20 || true)"
+  if grep -qiE "open mpi|openrte|prrte" <<< "$ver"; then echo openmpi
+  elif grep -qiE "pals" <<< "$ver"; then echo pals
+  else echo hydra; fi
+}
+style="${VIBEPROF_LAUNCHER_STYLE:-$(launcher_style)}"
+case "$style" in
+  srun)    exp="ALL"; for kv in "${vars[@]}"; do exp+=",$kv"; done
+           cmd=("$launcher" "--export=$exp" "$@") ;;
+  openmpi) cmd=("$launcher"); for kv in "${vars[@]}"; do cmd+=(-x "$kv"); done; cmd+=("$@") ;;
+  pals)    cmd=("$launcher"); for kv in "${vars[@]}"; do cmd+=(--env "$kv"); done; cmd+=("$@") ;;
+  hydra)   cmd=("$launcher"); for kv in "${vars[@]}"; do cmd+=(-genv "${kv%%=*}" "${kv#*=}"); done; cmd+=("$@") ;;
+  env)     echo "vibeprof-srun: unknown launcher '$name'; setting LD_PRELOAD for the launcher itself" >&2
+           cmd=(env "${vars[@]}" "$launcher" "$@") ;;
+  *)       echo "vibeprof-srun: VIBEPROF_LAUNCHER_STYLE must be srun, openmpi, pals, hydra or env" >&2; exit 2 ;;
 esac
 
-echo "vibeprof-srun: profile -> $out" >&2
+echo "vibeprof-srun: profile -> $out ($style launcher)" >&2
 set +e
 "${cmd[@]}"
 rc=$?
@@ -126,11 +141,28 @@ set -e
 
 if [[ $report -eq 1 ]]; then
   if ! compgen -G "$out/rank-*.json" > /dev/null; then
-    echo "vibeprof-srun: no rank profiles in $out (was the application linked against the same MPI ABI?)" >&2
+    echo "vibeprof-srun: no rank profiles in $out" >&2
+    if [[ -f "$out/started" ]]; then
+      echo "  The collector loaded and MPI_Init ran ($(head -1 "$out/started")), but no rank reached MPI_Finalize," >&2
+      echo "  where the profiles are written: the application failed (status $rc), called MPI_Abort or exit()" >&2
+      echo "  without MPI_Finalize, or was killed. Check its output above; to rule out the GPU measurement," >&2
+      echo "  rerun with --gpu none, and compare with a run without vibeprof." >&2
+    else
+      echo "  The collector never reached MPI_Init. Possible causes:" >&2
+      echo "   - the launcher did not pass LD_PRELOAD to the ranks (detected style: $style; set" >&2
+      echo "     VIBEPROF_LAUNCHER_STYLE=srun|openmpi|pals|hydra if that is wrong). Command was:" >&2
+      echo "       ${cmd[*]}" >&2
+      echo "   - the application is statically linked (ldd APP says 'not a dynamic executable'), or uses a" >&2
+      echo "     different MPI than libvibeprof.so: compare 'ldd APP | grep -i mpi' with" >&2
+      echo "     'ldd ${abs[${#abs[@]}-1]} | grep -i mpi'" >&2
+      echo "   - the application failed before MPI_Init (status $rc)" >&2
+    fi
     exit $(( rc ? rc : 3 ))
   fi
   if [[ -z "$llm_launcher" ]]; then
-    if [[ -n "${SLURM_JOB_ID:-}" ]]; then llm_launcher="srun -n 2 --overlap"; else llm_launcher="mpirun -np 2"; fi
+    if [[ -n "${SLURM_JOB_ID:-}" ]]; then llm_launcher="srun -n 2 --overlap"
+    elif [[ "$style" == pals ]]; then llm_launcher="$launcher -n 2 --ppn 2"
+    else llm_launcher="mpirun -np 2"; fi
   fi
   # shellcheck disable=SC2086
   python3 "$root/tools/vibeprof_report.py" "$out" --launcher "$llm_launcher" "${rargs[@]}" $extra

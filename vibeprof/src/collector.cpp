@@ -6,11 +6,12 @@
 // innermost open phase. Each phase instance (begin..end) is recorded with its computation and MPI
 // time, which gives per-iteration behavior. Sends also record bytes per destination world rank.
 //
-// At MPI_Finalize every rank writes <dir>/rank-NNNNNN.json; rank 0 also writes <dir>/run.json.
+// At MPI_Init rank 0 writes <dir>/started; at MPI_Finalize every rank writes <dir>/rank-NNNNNN.json
+// and rank 0 also writes <dir>/run.json.
 //
 // Environment:
 //   VIBEPROF=0               disable (wrappers forward directly)
-//   VIBEPROF_DIR=path        output directory (default vibeprof-<SLURM_JOB_ID[.STEP]> or vibeprof-<time>-<pid>)
+//   VIBEPROF_DIR=path        output directory (default vibeprof-<SLURM_JOB_ID[.STEP]|PBS job> or vibeprof-<time>-<pid>)
 //   VIBEPROF_MAX_INSTANCES   phase instances kept per phase (default 5000)
 //   VIBEPROF_FAKE_PPN=k      testing: report ranks as k-per-node on fake hosts (rank/k)
 //   VIBEPROF_GPU=auto|cuda|none   GPU backend (see gpu_cupti.cpp)
@@ -269,6 +270,10 @@ namespace {
 std::string default_dir() {
     const char * job = getenv("SLURM_JOB_ID");
     const char * step = getenv("SLURM_STEP_ID");
+    std::string pbs;
+    if (!job && (job = getenv("PBS_JOBID"))) {   // PBS: "1234567.polaris-pbs-01..." -> "1234567"
+        pbs = job; pbs = pbs.substr(0, pbs.find('.')); job = pbs.c_str(); step = nullptr;
+    }
     char buf[256];
     if (job) {
         snprintf(buf, sizeof(buf), "vibeprof-%s%s%s", job, step ? "." : "", step ? step : "");
@@ -309,6 +314,12 @@ void tool_init(int provided) {
         const char * d = getenv("VIBEPROF_DIR");
         snprintf(dir, sizeof(dir), "%s", d && *d ? d : default_dir().c_str());
         mkdir_p(dir);
+        // marker for vibeprof-srun: the collector loaded and MPI_Init ran (profiles come at MPI_Finalize)
+        std::string mk = std::string(dir) + "/started";
+        if (FILE * f = fopen(mk.c_str(), "w")) {
+            fprintf(f, "ranks %d\npid %d\nthread_level %d\n", s.size, (int) getpid(), provided);
+            fclose(f);
+        }
     }
     PMPI_Bcast(dir, (int) sizeof(dir), MPI_CHAR, 0, MPI_COMM_WORLD);
     PMPI_Barrier(MPI_COMM_WORLD);   // directory exists; also aligns the ranks' time origins
