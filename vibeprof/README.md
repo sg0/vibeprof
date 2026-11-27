@@ -226,6 +226,28 @@ per node before the LLM step loads it, e.g. `--model-stage /local/scratch` on Po
 either way, so ranks on a node share one copy of the weights in the page cache; staging keeps the reads off the
 shared file system and makes pages the kernel evicts under memory pressure cheap to read back.
 
+## Overheads
+
+The collector runs inside each application process: same ranks, nodes, CPU binding and GPUs,
+with no extra processes or devices. An application that uses all of a node's cores and GPUs therefore
+also pays for the measurement:
+
+- **MPI calls:** two clock reads and a table update per wrapped call (plus a mutex under
+  `MPI_THREAD_MULTIPLE`), and a device-pointer query per buffer when GPU measurement is on. The
+  computation between calls is not touched; codes with very many small MPI calls are affected most.
+- **GPUs:** CUPTI activity records (kernels, copies, memsets) are delivered in 8 MiB host buffers and
+  processed by a CUPTI thread inside the process, on the rank's own cores. CUDA API tracing adds about a
+  microsecond per CUDA call. `VIBEPROF_GPU_API=0` drops the API tracing (no phase attribution of GPU
+  work); `--gpu none` turns GPU measurement off.
+- **Memory:** per-rank tables per (phase, operation, call site), up to `VIBEPROF_MAX_INSTANCES` phase
+  instances, and the CUPTI buffers.
+- **I/O:** each rank writes one JSON file at `MPI_Finalize`, after the application's own work.
+- **After the run:** the analysis and the optional LLM step (including `--model-stage`) start once the
+  application has exited. They do not compete with it, but they use job time and the first node's GPUs.
+
+Overhead has not yet been measured on production nodes. To measure it for your application, compare
+the run time with `VIBEPROF=0` (library loaded, wrappers forward directly) and without vibeprof.
+
 ## Validation
 
 Ground truth comes from `libvibeperturb.so`, preloaded before the collector
@@ -297,7 +319,5 @@ blocking; delivers CUPTI callbacks and activity records), `tests/gpu_validate.sh
   per-phase busy time. Only one CUPTI client can subscribe to API callbacks: with Nsight Systems
   or another tool attached, kernels are still counted but not attributed to phases (reported as
   a warning).
-- **GPU overhead:** API tracing costs about a microsecond per CUDA call; set `VIBEPROF_GPU_API=0`
-  for very launch-heavy codes (no phase attribution then). Not yet measured on hardware.
 - **Other GPU vendors:** AMD (rocprofiler-sdk) and Intel (Level Zero) backends are not built;
   `src/gpu_backend.h` is the interface they would implement.
