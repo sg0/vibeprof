@@ -6,11 +6,6 @@ application phases (`setup`, `step/halo`, …). The analysis step finds hotspots
 writes text reports and an interactive HTML report with charts, and can ask a local LLM, run
 through `vibeprof_llm` on the same cluster, to interpret the results and suggest improvements.
 
-Status: prototype. CPU/MPI is validated on a toy program and three ECP proxy apps. NVIDIA GPU
-measurement (CUPTI) is built and validated on a simulated GPU; it still needs a run on real GPUs
-(`tests/gpu_validate.sh real`). Kokkos regions and kernel labels are supported. Helper processes
-per node that consolidate profiles on the fly are planned, not built.
-
 ```
  application ranks                       after the job step
  ┌──────────────────────┐                ┌──────────────────────────────────────────────┐
@@ -131,8 +126,7 @@ cmake -B build && cmake --build build -j          # builds build/gpu_toy with nv
 tests/gpu_validate.sh real gpu-validate-real      # GPU_AWARE=1 adds the GPU-aware MPI case
 ```
 
-The script runs `gpu_toy` with injected problems and prints PASS/FAIL per scenario. Please send
-`gpu-validate-real/summary.txt`, the `*/analysis/findings.json` files and one `rank-000000.json`.
+The script runs `gpu_toy` with injected problems and prints PASS/FAIL per scenario.
 Without a GPU, `tests/gpu_validate.sh sim` runs the same scenarios on the simulator.
 
 ## Outputs (`DIR/analysis/`)
